@@ -1,0 +1,296 @@
+import { stat, realpath } from "node:fs/promises";
+import type { ExtensionAPI, ExtensionContext, ToolDefinition } from "@earendil-works/pi-coding-agent";
+import { Type, type TSchema } from "typebox";
+import { confirmMutation } from "./confirm.ts";
+import { Registry, type RegistryEntry, type RegistryKind } from "./registry.ts";
+import { Targets, type PaneTarget, type SessionTarget, type WindowTarget } from "./targets.ts";
+import { Tmux, TmuxError, errorMessage } from "./tmux.ts";
+
+const Target = Type.String({ minLength: 1, description: "Explicit stable tmux ID from a listing (preferred), or an exact unambiguous name/index selector." });
+const SESSION = Type.Object({ target: Target });
+const WINDOW = Type.Object({ target: Target });
+const PANE = Type.Object({ target: Target });
+const KEYS = ["Enter", "Escape", "Tab", "BTab", "Space", "Backspace", "Delete", "Up", "Down", "Left", "Right", "Home", "End", "PageUp", "PageDown", "C-c", "C-d", "C-z", "C-\\", "C-a", "C-e", "C-l", "C-r", "C-u", "C-w"] as const;
+const SAFE_NAME = Type.String({ minLength: 1, maxLength: 64, description: "Name (no control characters)." });
+
+export function registerTmuxTools(pi: ExtensionAPI, tmux = new Tmux(), registry = new Registry()): void {
+  const targets = new Targets(tmux);
+  const register = <TParams extends TSchema>(definition: ToolDefinition<TParams>) => {
+    const execute = definition.execute;
+    return pi.registerTool({
+      ...definition,
+      async execute(...args: Parameters<typeof execute>) {
+        try { return await execute(...args); }
+        catch (error) { return toolError(error, definition.name, args[1]); }
+      },
+    });
+  };
+
+  register({ name: "tmux_list_sessions", label: "tmux sessions", description: "List sessions on the default tmux server, including existing sessions. Returns stable IDs. Each session reports whether it was created by this extension (tracked) and, when known, the session the creating agent ran in (parentSessionId).", promptSnippet: "List tmux sessions", parameters: Type.Object({ tracked: Type.Optional(Type.Boolean({ description: "Only sessions created by this extension (true) or only sessions not created by it (false)." })) }), async execute(_id, p, signal) {
+    const sessions = await targets.sessions(signal);
+    const tracked = await trackedSessions();
+    const items = sessions
+      .map((session) => ({ ...session, tracked: tracked.has(session.id), parentSessionId: tracked.get(session.id) ?? null }))
+      .filter((session) => p.tracked === undefined || session.tracked === p.tracked);
+    return result("list sessions", { items, registryFile: registry.file });
+  }});
+  register({ name: "tmux_list_created", label: "tmux targets created by Pi", description: "List tmux sessions, windows, and panes created through this extension, from the on-disk provenance registry, each marked live when the target still exists on the server. Read-only.", promptSnippet: "List tmux targets created by this extension", parameters: Type.Object({ kind: Type.Optional(Type.Union([Type.Literal("session"), Type.Literal("window"), Type.Literal("pane")])) }), async execute(_id, p, signal) {
+    let entries: RegistryEntry[];
+    try { entries = await registry.list(); }
+    catch (error) { throw error instanceof TmuxError ? error : new TmuxError(errorMessage(error), "command_failed"); }
+    const live = await targets.liveIds(signal);
+    const items = entries
+      .filter((entry) => !p.kind || entry.kind === p.kind)
+      .map((entry) => ({ ...entry, live: live.has(entry.id) }));
+    return result("list created targets", { items, registryFile: registry.file, caveat: "The registry only records targets created through this extension; targets created outside it are never listed, and entries can remain after the server stops." });
+  }});
+  register({ name: "tmux_list_clients", label: "tmux clients", description: "List currently attached tmux clients. Useful for selecting a session from Pi when Pi is outside tmux or when multiple clients are attached.", promptSnippet: "List attached tmux clients", parameters: Type.Object({}), async execute(_id, _params, signal) {
+    return result("list clients", await targets.clients(signal));
+  }});
+  register({ name: "tmux_list_windows", label: "tmux windows", description: "List windows across sessions or for an explicit session target. Returns stable IDs.", promptSnippet: "List tmux windows", parameters: Type.Object({ session: Type.Optional(Target) }), async execute(_id, params, signal) {
+    const all = await targets.windows(signal);
+    const session = params.session ? await targets.session(params.session, signal) : undefined;
+    const windows = session ? all.filter((window) => window.sessionId === session.id) : all;
+    return result("list windows", windows);
+  }});
+  register({ name: "tmux_list_panes", label: "tmux panes", description: "List panes across sessions or for an explicit session or window target. Returns stable IDs and pane dimensions/path.", promptSnippet: "List tmux panes", parameters: Type.Object({ session: Type.Optional(Target), window: Type.Optional(Target) }), async execute(_id, params, signal) {
+    if (params.session && params.window) throw new TmuxError("Specify either session or window, not both.", "invalid_option");
+    let panes = await targets.panes(signal);
+    if (params.session) { const session = await targets.session(params.session, signal); panes = panes.filter((pane) => pane.sessionId === session.id); }
+    if (params.window) { const window = await targets.window(params.window, signal); panes = panes.filter((pane) => pane.windowId === window.id); }
+    return result("list panes", panes);
+  }});
+
+  register({ name: "tmux_inspect_session", label: "tmux session details", description: "Inspect an explicit session by stable ID or exact unambiguous name.", promptSnippet: "Inspect a tmux session", parameters: SESSION, async execute(_id, p, signal) { return result("inspect session", await targets.session(p.target, signal)); }});
+  register({ name: "tmux_inspect_window", label: "tmux window details", description: "Inspect an explicit window by stable ID or exact unambiguous selector.", promptSnippet: "Inspect a tmux window", parameters: WINDOW, async execute(_id, p, signal) { return result("inspect window", await targets.window(p.target, signal)); }});
+  register({ name: "tmux_inspect_pane", label: "tmux pane details", description: "Inspect an explicit pane by stable ID or exact session:window.pane selector.", promptSnippet: "Inspect a tmux pane", parameters: PANE, async execute(_id, p, signal) { return result("inspect pane", await targets.pane(p.target, signal)); }});
+
+  register({ name: "tmux_capture_pane", label: "Capture tmux pane", description: "Capture a bounded plain-text snapshot of a pane's visible screen and optionally recent scrollback. This is not a command result and cannot establish process success or exit status. Pane contents may contain secrets and will be shared with the model.", promptSnippet: "Capture a bounded tmux pane snapshot", parameters: Type.Object({ target: Target, historyLines: Type.Optional(Type.Integer({ minimum: 0, maximum: 5000, description: "Scrollback lines before the visible screen (default 0)." })) }), async execute(_id, p, signal) {
+    const count = p.historyLines ?? 0;
+    if (!Number.isInteger(count) || count < 0 || count > 5000) throw new TmuxError("Scrollback line count must be an integer from 0 to 5000.", "invalid_option");
+    const pane = await targets.pane(p.target, signal);
+    const rawOutput = await tmux.run(["capture-pane", "-p", "-t", pane.id, ...(count ? ["-S", `-${count}`] : [])], { signal, maxOutputBytes: 2_000_000 });
+    const output = sanitizeCapture(rawOutput);
+    const lines = output.split("\n");
+    if (lines.at(-1) === "") lines.pop(); // capture-pane commonly terminates output with a newline
+    const lineLimit = 3000;
+    const selected = lines.length > lineLimit ? lines.slice(-lineLimit).join("\n") : output;
+    const buffer = Buffer.from(selected, "utf8");
+    const byteLimit = 40_000;
+    const notice = `[Snapshot truncated to the most recent ${lineLimit} lines / ${byteLimit} bytes.]\n`;
+    const truncated = lines.length > lineLimit || buffer.byteLength > byteLimit;
+    const contentLimit = truncated ? byteLimit - Buffer.byteLength(notice) : byteLimit;
+    let text = buffer.byteLength > contentLimit
+      ? buffer.subarray(buffer.byteLength - contentLimit).toString("utf8").replace(/^\uFFFD+/, "")
+      : selected;
+    if (truncated) text = `${notice}${text}`;
+    return result("capture pane snapshot (not a command result)", { target: pane, snapshot: text, truncated, historyLinesRequested: count, caveat: "Snapshot only; does not indicate process completion or exit status." });
+  }});
+
+  register({ name: "tmux_create_session", label: "Create tmux session", description: "Create a detached tmux session, optionally with a name and working directory. Does not attach or replace Pi's terminal. The new session is recorded in the provenance registry so it can later be identified as created by Pi. Provide parent to record which session it was created from; when omitted, the session Pi itself runs in is detected if possible.", promptSnippet: "Create a detached tmux session", parameters: Type.Object({ name: Type.Optional(SAFE_NAME), cwd: Type.Optional(Type.String({ minLength: 1 })), parent: Type.Optional(Target) }), async execute(_id, p, signal) {
+    validateName(p.name);
+    const cwd = p.cwd ? await validateDirectory(p.cwd) : undefined;
+    const parentSessionId = p.parent ? (await targets.session(p.parent, signal)).id : await detectParentSession(tmux, signal);
+    const args = ["new-session", "-d", "-P", "-F", "#{session_id}\t#{session_name}", ...(p.name ? ["-s", p.name] : []), ...(cwd ? ["-c", cwd] : [])];
+    const [id, autoName] = singleRow(await tmux.run(args, { signal }), 2);
+    if (!/^\$\d+$/.test(id!)) throw new TmuxError("tmux created a session but returned an invalid stable ID.");
+    const name = p.name ?? autoName ?? id!;
+    const record = await remember({ kind: "session", id: id!, sessionId: id!, parentSessionId, name, cwd, tool: "tmux_create_session" });
+    return result("create detached session", { id, name, attached: false, parentSessionId, ...record });
+  }});
+  register({ name: "tmux_create_window", label: "Create tmux window", description: "Create a detached window in an explicit session; does not switch the current window. The window is recorded in the provenance registry.", promptSnippet: "Create a detached tmux window", parameters: Type.Object({ session: Target, name: Type.Optional(SAFE_NAME), cwd: Type.Optional(Type.String({ minLength: 1 })) }), async execute(_id, p, signal) {
+    validateName(p.name);
+    const cwd = p.cwd ? await validateDirectory(p.cwd) : undefined;
+    const session = await targets.session(p.session, signal);
+    await targets.session(session.id, signal);
+    const output = await tmux.run(["new-window", "-d", "-P", "-F", "#{window_id}\t#{window_name}", "-t", session.id, ...(p.name ? ["-n", p.name] : []), ...(cwd ? ["-c", cwd] : [])], { signal });
+    const [id, autoName] = singleRow(output, 2);
+    if (!/^@\d+$/.test(id!)) throw new TmuxError("tmux created a window but returned an invalid stable ID.");
+    const name = p.name ?? autoName ?? id!;
+    const parentSessionId = await parentOf(session.id, signal);
+    const record = await remember({ kind: "window", id: id!, sessionId: session.id, windowId: id!, parentSessionId, name, cwd, tool: "tmux_create_window" });
+    return result("create detached window", { id, sessionId: session.id, name, selected: false, parentSessionId, ...record });
+  }});
+
+  register({ name: "tmux_rename_session", label: "Rename tmux session", description: "Rename an explicitly targeted session. No confirmation is required for this non-destructive structural change.", promptSnippet: "Rename a tmux session", parameters: Type.Object({ target: Target, name: SAFE_NAME }), async execute(_id, p, signal) {
+    validateName(p.name); const session = await targets.session(p.target, signal); await targets.session(session.id, signal);
+    await tmux.run(["rename-session", "-t", session.id, p.name], { signal }); return result("rename session", { id: session.id, previousName: session.name, name: p.name });
+  }});
+  register({ name: "tmux_rename_window", label: "Rename tmux window", description: "Rename an explicitly targeted window.", promptSnippet: "Rename a tmux window", parameters: Type.Object({ target: Target, name: SAFE_NAME }), async execute(_id, p, signal) {
+    validateName(p.name); const window = await targets.window(p.target, signal); await targets.window(window.id, signal);
+    await tmux.run(["rename-window", "-t", window.id, p.name], { signal }); return result("rename window", { id: window.id, previousName: window.name, name: p.name });
+  }});
+  register({ name: "tmux_select_session", label: "Select tmux session", description: "Switch an existing attached tmux client to an explicit session. If exactly one client is attached it is selected automatically; with multiple clients, provide a client name from tmux_list_clients. This never attaches a client.", promptSnippet: "Select a tmux session for an attached client", parameters: Type.Object({ target: Target, client: Type.Optional(Type.String({ minLength: 1, description: "Exact attached client name from tmux_list_clients; required when more than one client is attached." })) }), async execute(_id, p, signal) {
+    const session = await targets.session(p.target, signal);
+    let client;
+    if (p.client) client = await targets.client(p.client, signal);
+    else {
+      const clients = await targets.clients(signal);
+      if (clients.length === 0) throw new TmuxError("No attached tmux client is available; session selection requires an existing client. Use tmux_list_clients to inspect attached clients.", "invalid_target");
+      if (clients.length > 1) throw new TmuxError("Multiple tmux clients are attached; provide an exact client name from tmux_list_clients.", "invalid_target");
+      client = clients[0]!;
+    }
+    await targets.session(session.id, signal);
+    await targets.client(client.name, signal);
+    await tmux.run(["switch-client", "-c", client.name, "-t", session.id], { signal });
+    return result("select session", { id: session.id, name: session.name, client: client.name });
+  }});
+  register({ name: "tmux_select_window", label: "Select tmux window", description: "Select a window in its session for an existing tmux client.", promptSnippet: "Select a tmux window", parameters: WINDOW, async execute(_id, p, signal) {
+    const window = await targets.window(p.target, signal); await targets.window(window.id, signal);
+    await tmux.run(["select-window", "-t", window.id], { signal }); return result("select window", { id: window.id, name: window.name, sessionId: window.sessionId });
+  }});
+  register({ name: "tmux_split_pane", label: "Split tmux pane", description: "Split an explicitly targeted pane. Horizontal creates side-by-side panes; vertical creates stacked panes. The new pane is not selected and is recorded in the provenance registry.", promptSnippet: "Split a tmux pane", parameters: Type.Object({ target: Target, orientation: Type.Union([Type.Literal("horizontal"), Type.Literal("vertical")]), cwd: Type.Optional(Type.String({ minLength: 1 })) }), async execute(_id, p, signal) {
+    const cwd = p.cwd ? await validateDirectory(p.cwd) : undefined; const pane = await targets.pane(p.target, signal); await targets.pane(pane.id, signal);
+    const output = await tmux.run(["split-window", "-d", "-P", "-F", "#{pane_id}\t#{pane_index}\t#{window_name}\t#{session_name}", p.orientation === "horizontal" ? "-h" : "-v", "-t", pane.id, ...(cwd ? ["-c", cwd] : [])], { signal });
+    const [id, paneIndex, windowName, sessionName] = singleRow(output, 4);
+    if (!/^%\d+$/.test(id!)) throw new TmuxError("tmux split a pane but returned an invalid stable ID.");
+    const name = `${sessionName ?? pane.sessionName}:${windowName ?? pane.windowName}.${paneIndex ?? "?"}`;
+    const parentSessionId = await parentOf(pane.sessionId, signal);
+    const record = await remember({ kind: "pane", id: id!, sessionId: pane.sessionId, windowId: pane.windowId, parentSessionId, name, cwd, tool: "tmux_split_pane" });
+    return result("split pane", { id, parentPaneId: pane.id, orientation: p.orientation, selected: false, name, parentSessionId, ...record });
+  }});
+  register({ name: "tmux_select_pane", label: "Select tmux pane", description: "Select an explicitly targeted pane.", promptSnippet: "Select a tmux pane", parameters: PANE, async execute(_id, p, signal) {
+    const pane = await targets.pane(p.target, signal); await targets.pane(pane.id, signal); await tmux.run(["select-pane", "-t", pane.id], { signal });
+    return result("select pane", { id: pane.id, sessionId: pane.sessionId, windowId: pane.windowId });
+  }});
+  register({ name: "tmux_resize_pane", label: "Resize tmux pane", description: "Resize an explicitly targeted pane by a positive number of cells along one dimension.", promptSnippet: "Resize a tmux pane", parameters: Type.Object({ target: Target, dimension: Type.Union([Type.Literal("width"), Type.Literal("height")]), amount: Type.Integer({ minimum: 1, maximum: 500 }) }), async execute(_id, p, signal) {
+    if (!Number.isInteger(p.amount) || p.amount < 1 || p.amount > 500) throw new TmuxError("Resize amount must be an integer from 1 to 500 cells.", "invalid_option");
+    const pane = await targets.pane(p.target, signal); await targets.pane(pane.id, signal);
+    await tmux.run(["resize-pane", "-t", pane.id, p.dimension === "width" ? "-x" : "-y", String(p.amount)], { signal });
+    return result("resize pane", { id: pane.id, dimension: p.dimension, amount: p.amount });
+  }});
+
+  register({ name: "tmux_send_text", label: "Send text to tmux pane", description: "Send literal text to an explicitly targeted pane without confirmation. Does not append Enter; text may still affect or execute commands if it contains terminal control/newline input.", promptSnippet: "Send literal text to a tmux pane", parameters: Type.Object({ target: Target, text: Type.String({ minLength: 1, maxLength: 10000 }) }), async execute(_id, p, signal) {
+    if (p.text.includes("\0")) throw new TmuxError("Text cannot contain NUL bytes.", "invalid_option");
+    const pane = await targets.pane(p.target, signal);
+    await targets.pane(pane.id, signal);
+    await tmux.run(["send-keys", "-l", "-t", pane.id, "--", p.text], { signal });
+    return result("send literal text (no Enter appended)", { paneId: pane.id, bytes: Buffer.byteLength(p.text), enterAppended: false });
+  }});
+  register({ name: "tmux_send_key", label: "Send named key to tmux pane", description: `Send one restricted named key to an explicitly targeted pane without confirmation. Supported: ${KEYS.join(", ")}.`, promptSnippet: "Send a named key to a tmux pane", parameters: Type.Object({ target: Target, key: Type.Union(KEYS.map((key) => Type.Literal(key))) }), async execute(_id, p, signal) {
+    const pane = await targets.pane(p.target, signal); await targets.pane(pane.id, signal);
+    await tmux.run(["send-keys", "-t", pane.id, p.key], { signal });
+    return result("send named key", { paneId: pane.id, key: p.key });
+  }});
+
+  registerKill("tmux_kill_session", "session", "session", (selector, signal) => targets.session(selector, signal), (t) => t.id, (t) => `${t.name} (${t.id})`);
+  registerKill("tmux_kill_window", "window", "window", (selector, signal) => targets.window(selector, signal), (t) => t.id, (t) => `${t.sessionName}:${t.name} (${t.id})`);
+  registerKill("tmux_kill_pane", "pane", "pane", (selector, signal) => targets.pane(selector, signal), (t) => t.id, describePane);
+
+  function registerKill<T extends SessionTarget | WindowTarget | PaneTarget>(
+    name: string, kind: RegistryKind, noun: string,
+    resolveTarget: (selector: string, signal?: AbortSignal) => Promise<T>,
+    idOf: (target: T) => string, describe: (target: T) => string,
+  ) {
+    register({ name, label: `Kill tmux ${noun}`, description: `Permanently kill an explicitly targeted ${noun}. Requires confirmation and revalidates its stable ID before mutation.`, promptSnippet: `Kill a confirmed tmux ${noun}`, parameters: Type.Object({ target: Target }), async execute(_id, p, signal, _update, ctx) {
+      const target = await resolveTarget(p.target, signal); const stableId = idOf(target);
+      let action = `kill ${noun}`;
+      if (kind === "pane" && "windowId" in target) {
+        const siblings = new Set((await targets.panes(signal)).filter((pane) => pane.windowId === target.windowId).map((pane) => pane.id));
+        if (siblings.size === 1) action += " (also removes its window because this is the last pane)";
+      } else if (kind === "window" && "sessionId" in target) {
+        const siblings = new Set((await targets.windows(signal)).filter((window) => window.sessionId === target.sessionId).map((window) => window.id));
+        if (siblings.size === 1) action += " (also removes its session because this is the last window)";
+      }
+      await confirmMutation(ctx, action, describe(target), signal);
+      await resolveTarget(stableId, signal);
+      await tmux.run([`kill-${kind}`, "-t", stableId], { signal });
+      const forgotten = await forgetTarget(kind, target, stableId);
+      return result(`kill ${noun}`, { id: stableId, approved: true, removed: true, forgotten });
+    }});
+  }
+
+  async function remember(entry: Omit<RegistryEntry, "createdAt">): Promise<{ tracked: boolean; registryError?: string }> {
+    try {
+      await registry.record({ ...entry, createdAt: new Date().toISOString() });
+      return { tracked: true };
+    } catch (error) {
+      // The tmux target already exists; losing provenance must not hide that.
+      return { tracked: false, registryError: errorMessage(error) };
+    }
+  }
+
+  async function forgetTarget(kind: RegistryKind, target: SessionTarget | WindowTarget | PaneTarget, stableId: string): Promise<number> {
+    try {
+      return await registry.forget(kind, stableId, { sessionId: "sessionId" in target ? target.sessionId : undefined });
+    } catch {
+      return 0; // A stale entry is harmless; a failed kill report is not.
+    }
+  }
+
+  /** Reads the registry without letting a broken file break plain tmux inspection. */
+  async function trackedSessions(): Promise<Map<string, string | null>> {
+    const found = new Map<string, string | null>();
+    try {
+      for (const entry of await registry.list()) if (entry.kind === "session") found.set(entry.id, entry.parentSessionId);
+    } catch { /* Report sessions anyway; provenance is best-effort metadata. */ }
+    return found;
+  }
+
+  /** The session the creating agent ran in, when it could be determined. */
+  async function parentOf(sessionId: string, signal?: AbortSignal): Promise<string | null> {
+    const tracked = await trackedSessions();
+    if (tracked.has(sessionId)) return tracked.get(sessionId) ?? null;
+    return detectParentSession(tmux, signal);
+  }
+}
+
+/** The session the calling agent runs inside, when tmux can report it. */
+async function detectParentSession(tmux: Tmux, signal?: AbortSignal): Promise<string | null> {
+  const pane = process.env.TMUX_PANE;
+  if (!pane) return null;
+  try {
+    const id = singleLine(await tmux.run(["display-message", "-p", "-t", pane, "#{session_id}"], { signal }));
+    return /^\$\d+$/.test(id) ? id : null;
+  } catch {
+    return null; // Running outside this server, or the pane is gone: provenance stays unknown.
+  }
+}
+
+function validateName(name: string | undefined): void {
+  if (name !== undefined && (!name.trim() || name !== name.trim() || /[\x00-\x1f\x7f]/.test(name))) {
+    throw new TmuxError("Name must be non-empty, trimmed, and contain no control characters.", "invalid_option");
+  }
+}
+async function validateDirectory(path: string): Promise<string> {
+  if (!path || path.includes("\0")) throw new TmuxError("Working directory must be a non-empty path.", "invalid_option");
+  try {
+    const absolute = await realpath(path);
+    if (!(await stat(absolute)).isDirectory()) throw new Error("not a directory");
+    return absolute;
+  } catch {
+    throw new TmuxError(`Working directory ${JSON.stringify(path)} does not exist or is not a directory.`, "invalid_option");
+  }
+}
+function singleLine(output: string): string {
+  const lines = output.trim().split(/\r?\n/);
+  if (lines.length !== 1 || !lines[0]) throw new TmuxError("tmux returned unexpected output for a created target.");
+  return lines[0];
+}
+/** Parses one tab-separated row of a `-P -F` result, e.g. an ID plus its human name. */
+function singleRow(output: string, columns: number): (string | undefined)[] {
+  const fields = singleLine(output).split("\t");
+  if (fields.length !== columns) throw new TmuxError("tmux returned unexpected output for a created target.");
+  return fields;
+}
+function describePane(pane: PaneTarget): string { return `${pane.sessionName}:${pane.windowName}.${pane.index} (${pane.id})`; }
+function result(operation: string, value: unknown) {
+  return { content: [{ type: "text" as const, text: JSON.stringify({ operation, ...asObject(value) }, null, 2) }], details: { operation, value } };
+}
+function asObject(value: unknown): Record<string, unknown> { return value !== null && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : { items: value }; }
+
+export function sanitizeCapture(text: string): string {
+  return text
+    .replace(/\x1b(?:\[[0-?]*[ -/]*[@-~]|\][^\x07]*(?:\x07|\x1b\\)|[@-_])/g, "")
+    .replace(/\r/g, "")
+    .replace(/[\x00-\x08\x0b-\x1f\x7f]/g, "");
+}
+
+export function toolError(error: unknown, operation?: string, params?: unknown) {
+  const message = error instanceof TmuxError ? error.message : errorMessage(error);
+  const record = params !== null && typeof params === "object" ? params as Record<string, unknown> : {};
+  const target = [record.target, record.session, record.window].find((value) => typeof value === "string");
+  const code = error instanceof TmuxError ? error.code : "command_failed";
+  const details = { ...(operation ? { operation } : {}), ...(target ? { target } : {}), code, error: message };
+  return { content: [{ type: "text" as const, text: `tmux error: ${JSON.stringify(details)}` }], isError: true, details };
+}
