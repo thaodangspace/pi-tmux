@@ -25,6 +25,8 @@ export interface RegistryEntry {
   windowId?: string;
   /** Session the creating agent ran in, if it could be determined. */
   parentSessionId: string | null;
+  /** Pi conversation session that created this target; absent on legacy records. */
+  piSessionId?: string;
   name: string;
   cwd?: string;
   /** Tool that created the target. */

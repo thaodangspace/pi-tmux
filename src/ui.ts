@@ -1,5 +1,7 @@
 import type { ExtensionAPI, ExtensionCommandContext, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { isTrackedLive, type Registry, type RegistryEntry, type RegistryKind } from "./registry.ts";
+import { confirmMutation } from "./confirm.ts";
+import { assertSamePlacement, checkOwnership } from "./ownership.ts";
 import type { LiveTargets } from "./targets.ts";
 import { Targets } from "./targets.ts";
 import { Tmux, TmuxError, errorMessage } from "./tmux.ts";
@@ -40,7 +42,7 @@ export function registerTmuxUi(pi: ExtensionAPI, options: TmuxUiOptions): void {
       return;
     }
     try {
-      const entries = await registry.list();
+      const entries = (await registry.list()).filter((entry) => entry.piSessionId === ctx.sessionManager.getSessionId());
       const lines = formatCreated(entries, entries.length ? await targets.liveTargets() : { live: new Set(), labels: new Map() });
       ctx.ui.setWidget(WIDGET_KEY, lines.length ? lines : undefined, { placement: "belowEditor" });
     } catch (error) {
@@ -74,7 +76,8 @@ export function registerTmuxUi(pi: ExtensionAPI, options: TmuxUiOptions): void {
         ctx.ui.notify("pi-tmux: widget hidden. Use /tmux on to restore it.", "info");
         return;
       case "prune":
-        await prune(ctx);
+        if (rest.length > 1 || (rest.length === 1 && rest[0] !== "all")) break;
+        await prune(ctx, rest[0] === "all");
         return;
       case "list":
         if (rest.length) break;
@@ -83,14 +86,14 @@ export function registerTmuxUi(pi: ExtensionAPI, options: TmuxUiOptions): void {
       default:
         break;
     }
-    ctx.ui.notify(`pi-tmux: unknown argument ${JSON.stringify(subcommand)}. Use /tmux [list|on|off|prune].`, "warning");
+    ctx.ui.notify(`pi-tmux: unknown argument ${JSON.stringify(subcommand)}. Use /tmux [list|on|off|prune [all]].`, "warning");
   }
 
   async function list(ctx: ExtensionCommandContext): Promise<void> {
     let entries: RegistryEntry[];
     let view: LiveTargets;
     try {
-      entries = await registry.list();
+      entries = (await registry.list()).filter((entry) => entry.piSessionId === ctx.sessionManager.getSessionId());
       view = await targets.liveTargets();
     } catch (error) {
       ctx.ui.notify(`pi-tmux: ${errorMessage(error)}`, "error");
@@ -173,23 +176,24 @@ export function registerTmuxUi(pi: ExtensionAPI, options: TmuxUiOptions): void {
   }
 
   async function kill(entry: RegistryEntry, ctx: ExtensionCommandContext, view: LiveTargets): Promise<void> {
-    const label = describe(entry, view);
-    const approved = ctx.hasUI
-      ? await ctx.ui.confirm(`Confirm tmux kill ${entry.kind}`, `Allow kill ${entry.kind} for ${label}? This permanently destroys the selected tmux target.`)
-      : false;
-    if (!approved) throw new TmuxError("Action was not approved; no tmux action was taken.", "cancelled");
+    if (entry.piSessionId !== ctx.sessionManager.getSessionId()) throw new TmuxError("Target belongs to another Pi session.", "invalid_target");
+    await resolveLive(entry);
+    const before = await checkOwnership(targets, registry, entry.kind, entry.id, ctx.sessionManager.getSessionId());
+    if (!before.exclusive) await confirmMutation(ctx, `kill ${entry.kind}`, `${describe(entry, view)} (${before.reason})`);
     await resolveLive(entry); // Revalidate immediately before mutating.
+    const after = await checkOwnership(targets, registry, entry.kind, entry.id, ctx.sessionManager.getSessionId());
+    assertSamePlacement(before, after);
     await options.tmux.run([`kill-${entry.kind}`, "-t", entry.id]);
     const forgotten = await registry.forget(entry.kind, entry.id, { sessionId: entry.sessionId }).catch(() => 0);
     ctx.ui.notify(`pi-tmux: killed ${entry.kind} ${entry.name}; removed ${forgotten} registry entr${forgotten === 1 ? "y" : "ies"}.`, "info");
   }
 
   /** Drops entries whose target no longer exists, refusing when nothing is visible. */
-  async function prune(ctx: ExtensionCommandContext): Promise<void> {
+  async function prune(ctx: ExtensionCommandContext, all = false): Promise<void> {
     let entries: RegistryEntry[];
     let view: LiveTargets;
     try {
-      entries = await registry.list();
+      entries = (await registry.list()).filter((entry) => all || entry.piSessionId === ctx.sessionManager.getSessionId());
       view = await targets.liveTargets();
     } catch (error) {
       ctx.ui.notify(`pi-tmux: ${errorMessage(error)}`, "error");
@@ -199,7 +203,7 @@ export function registerTmuxUi(pi: ExtensionAPI, options: TmuxUiOptions): void {
       ctx.ui.notify("pi-tmux: refusing to prune because no tmux sessions/windows/panes are visible (is the server running?).", "warning");
       return;
     }
-    const gone = entries.filter((entry) => !isTrackedLive(entry, view));
+    const gone = entries.filter((entry) => (entry.serverIdentity === view.serverIdentity || !entry.serverIdentity) && !isTrackedLive(entry, view));
     if (!gone.length) {
       ctx.ui.notify("pi-tmux: nothing to prune; every recorded target still exists.", "info");
       return;
@@ -211,7 +215,10 @@ export function registerTmuxUi(pi: ExtensionAPI, options: TmuxUiOptions): void {
       ctx.ui.notify("pi-tmux: prune cancelled.", "info");
       return;
     }
-    const removed = await registry.remove((entry) => !isTrackedLive(entry, view));
+    const current = await targets.liveTargets();
+    if (!current.live.size || current.serverIdentity !== view.serverIdentity) throw new TmuxError("tmux server changed before prune.", "invalid_target");
+    const removed = await registry.remove((entry) => (all || entry.piSessionId === ctx.sessionManager.getSessionId())
+      && (entry.serverIdentity === current.serverIdentity || !entry.serverIdentity) && !isTrackedLive(entry, current));
     ctx.ui.notify(`pi-tmux: pruned ${removed} gone entr${removed === 1 ? "y" : "ies"}.`, "info");
   }
 }

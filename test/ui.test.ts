@@ -11,7 +11,7 @@ import { formatCreated, registerTmuxUi } from "../src/ui.ts";
 const NOW = Date.parse("2026-03-01T12:00:00.000Z");
 const created = (overrides: Partial<RegistryEntry>): RegistryEntry => ({
   kind: "session", id: "$3", sessionId: "$3", parentSessionId: null, name: "pi-test",
-  tool: "tmux_create_session", createdAt: "2026-03-01T11:58:00.000Z", serverIdentity: "123:456", ...overrides,
+  piSessionId: "pi-current", tool: "tmux_create_session", createdAt: "2026-03-01T11:58:00.000Z", serverIdentity: "123:456", ...overrides,
 });
 
 class FakeTmux extends Tmux {
@@ -26,7 +26,8 @@ class FakeTmux extends Tmux {
     if (args[0] === "display-message") return "123:456\n";
     if (args[0] === "list-sessions") return this.sessions;
     if (args[0] === "list-windows") return this.windows;
-    if (args[0] === "list-panes") return this.panes;
+    if (args[0] === "list-panes") return args.includes("#{session_id}\t#{window_id}\t#{pane_id}\t#{window_linked}\t#{session_grouped}")
+      ? "$3\t@4\t%1\t0\t0\n" : this.panes;
     if (args[0] === "list-clients") return this.clients;
     if (args[0] === "capture-pane") return this.capture;
     return "";
@@ -89,6 +90,8 @@ test("the widget tracks the registry and can be hidden", async () => {
   await withDirectory(async (directory) => {
     await harness(async ({ handlers, registry, widgets }) => {
       await registry.record(created({}));
+      await registry.record(created({ id: "$8", sessionId: "$8", piSessionId: "pi-other", name: "other" }));
+      await registry.record(created({ id: "$9", sessionId: "$9", piSessionId: undefined, name: "legacy" }));
       await handlers.get("session_start")!({}, widgetContext(widgets, "tui"));
       assert.equal((widgets.at(-1) as string[])[0], "pi-tmux · 1 created");
       assert.match((widgets.at(-1) as string[])[1]!, /^● pi-test  session  \d+[smhd]$/);
@@ -131,7 +134,7 @@ test("/tmux list falls back to a plain notification without UI and hides the wid
   });
 });
 
-test("the picker kills a tracked session only after confirmation and forgets its children", async () => {
+test("the picker kills a session owned by this Pi session without confirmation and forgets its children", async () => {
   await withDirectory(async (directory) => {
     await harness(async ({ command, registry, tmux, notices }) => {
       await registry.record(created({}));
@@ -146,14 +149,10 @@ test("the picker kills a tracked session only after confirmation and forgets its
   });
 });
 
-test("a refused kill and a cancelled picker change nothing", async () => {
+test("a cancelled picker changes nothing", async () => {
   await withDirectory(async (directory) => {
     await harness(async ({ command, registry, tmux }) => {
       await registry.record(created({}));
-      await command("list", interactiveContext({ selections: [0, 3], confirmations: [false] }));
-      assert.equal(tmux.commands.some((args) => args[0] === "kill-session"), false);
-      assert.equal((await registry.list()).length, 1);
-
       await command("list", interactiveContext({ cancel: true }));
       assert.equal((await registry.list()).length, 1);
     }, directory);
@@ -186,12 +185,25 @@ test("prune refuses to guess while the server is empty and removes only stale en
   });
 });
 
+test("prune all cleans stale legacy and other-conversation entries but keeps live and other-server entries", async () => {
+  await withDirectory(async (directory) => {
+    await harness(async ({ command, registry, notices }) => {
+      await registry.record(created({}));
+      await registry.record(created({ id: "$8", sessionId: "$8", piSessionId: "pi-other" }));
+      await registry.record(created({ id: "$9", sessionId: "$9", piSessionId: undefined }));
+      await registry.record(created({ id: "$10", sessionId: "$10", serverIdentity: "999:999" }));
+      await command("prune all", interactiveContext({ confirmations: [true] }, notices));
+      assert.deepEqual((await registry.list()).map((entry) => entry.id).sort(), ["$3", "$10"].sort());
+    }, directory);
+  });
+});
+
 function widgetContext(widgets: unknown[], mode: string) {
-  return { mode, hasUI: mode === "tui", ui: { setWidget: (_key: string, content: unknown) => widgets.push(content) } };
+  return { mode, hasUI: mode === "tui", sessionManager: { getSessionId: () => "pi-current" }, ui: { setWidget: (_key: string, content: unknown) => widgets.push(content) } };
 }
 
 function plainContext(notices: string[]) {
-  return { mode: "print", hasUI: false, ui: { notify: (message: string) => notices.push(message) } };
+  return { mode: "print", hasUI: false, sessionManager: { getSessionId: () => "pi-current" }, ui: { notify: (message: string) => notices.push(message) } };
 }
 
 function interactiveContext(options: { selections?: number[]; confirmations?: boolean[]; cancel?: boolean }, notices: string[] = []) {
@@ -200,6 +212,7 @@ function interactiveContext(options: { selections?: number[]; confirmations?: bo
   return {
     mode: "tui",
     hasUI: true,
+    sessionManager: { getSessionId: () => "pi-current" },
     ui: {
       select(_title: string, choices: string[]) {
         return Promise.resolve(options.cancel ? undefined : choices[selections.shift() ?? 0]);

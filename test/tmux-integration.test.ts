@@ -25,6 +25,7 @@ test("isolated tmux server exercises tools without touching the user's default s
   let approve = false;
   const context = {
     hasUI: true,
+    sessionManager: { getSessionId: () => "pi-current" },
     ui: { async confirm() { return approve; } },
   } as unknown as ExtensionContext;
   const call = async (name: string, params: Record<string, unknown> = {}, ctx = context) => {
@@ -72,13 +73,24 @@ test("isolated tmux server exercises tools without touching the user's default s
     const firstPaneList = await call("tmux_list_panes", { window: window.id });
     assert.equal(firstPaneList.items.length, 1);
     const pane = firstPaneList.items[0].id;
-    const headless = { hasUI: false, ui: {} } as unknown as ExtensionContext;
-    assert.match(await callError("tmux_send_text", { target: pane, text: "echo FORBIDDEN" }, headless), /not approved|confirmation|UI/i);
-    assert.match(await callError("tmux_send_key", { target: pane, key: "Enter" }, headless), /not approved|confirmation|UI/i);
-    let paneKillPrompt = "";
-    const refuseLastPane = { hasUI: true, ui: { async confirm(title: string) { paneKillPrompt = title; return false; } } } as unknown as ExtensionContext;
-    assert.match(await callError("tmux_kill_pane", { target: pane }, refuseLastPane), /not approved/);
-    assert.match(paneKillPrompt, /last pane/);
+    const headless = { hasUI: false, sessionManager: context.sessionManager, ui: {} } as unknown as ExtensionContext;
+    await call("tmux_send_text", { target: pane, text: "echo PI_OWNED" }, headless);
+    await call("tmux_send_key", { target: pane, key: "Enter" }, headless);
+    await runTmux(socket, ["new-session", "-d", "-s", "external"]);
+    const externalPane = (await call("tmux_list_panes", { session: "external" })).items[0].id;
+    assert.match(await callError("tmux_send_key", { target: externalPane, key: "Enter" }, headless), /confirmation|UI/i);
+    assert.match(await callError("tmux_kill_session", { target: "external" }, headless), /confirmation|UI/i);
+    await runTmux(socket, ["link-window", "-s", window.id, "-t", "external:"]);
+    assert.match(await callError("tmux_send_key", { target: pane, key: "Enter" }, headless), /confirmation|UI/i);
+    assert.match(await callError("tmux_kill_window", { target: window.id }, headless), /confirmation|UI/i);
+    assert.match(await callError("tmux_kill_session", { target: created.id }, headless), /confirmation|UI/i);
+    await runTmux(socket, ["unlink-window", "-t", "external:" + (await call("tmux_list_windows", { session: "external" })).items.find((item: any) => item.id === window.id).index]);
+    await runTmux(socket, ["kill-session", "-t", "external"]);
+    const otherPi = { hasUI: false, sessionManager: { getSessionId: () => "pi-other" }, ui: {} } as unknown as ExtensionContext;
+    assert.match(await callError("tmux_send_key", { target: pane, key: "Enter" }, otherPi), /confirmation|UI/i);
+    assert.match(await callError("tmux_kill_session", { target: created.id }, otherPi), /confirmation|UI/i);
+    assert.deepEqual((await call("tmux_list_created", {}, otherPi)).items, []);
+    assert.equal((await call("tmux_list_sessions", {}, otherPi)).items[0].tracked, false);
     assert.equal((await call("tmux_list_panes", { window: window.id })).items.length, 1);
     const split = await call("tmux_split_pane", { target: pane, orientation: "horizontal", cwd: directory });
     assert.match(split.id, /^%\d+$/);
@@ -96,9 +108,8 @@ test("isolated tmux server exercises tools without touching the user's default s
     await call("tmux_send_key", { target: probe.id, key: "Enter" }, headlessContext);
     const probeCapture = await call("tmux_capture_pane", { target: probe.id, historyLines: 20 });
     assert.ok(probeCapture.snapshot.split("PI_NO_UI_MARKER").length - 1 >= 2, probeCapture.snapshot);
-    await call("tmux_kill_pane", { target: probe.id }, { hasUI: true, ui: { async confirm() { return true; } } } as unknown as ExtensionContext);
+    await call("tmux_kill_pane", { target: probe.id }, headless);
     assert.equal((await call("tmux_list_panes", { window: window.id })).items.length, 2);
-    assert.match(await callError("tmux_kill_session", { target: created.id }, { ...context, ui: { async confirm() { return false; } } } as unknown as ExtensionContext), /not approved/);
     assert.equal((await call("tmux_list_sessions")).items.length, 1);
 
     approve = true;
@@ -114,12 +125,13 @@ test("isolated tmux server exercises tools without touching the user's default s
     const racingPane = await call("tmux_split_pane", { target: pane, orientation: "vertical" });
     const disappearingContext = {
       hasUI: true,
+      sessionManager: otherPi.sessionManager,
       ui: { async confirm() { await tmux.run(["kill-pane", "-t", racingPane.id]); return true; } },
     } as unknown as ExtensionContext;
     assert.match(await callError("tmux_kill_pane", { target: racingPane.id }, disappearingContext), /not found/);
     assert.equal((await call("tmux_list_panes", { window: window.id })).items.length, 2);
 
-    const removedPane = await call("tmux_kill_pane", { target: split.id });
+    const removedPane = await call("tmux_kill_pane", { target: split.id }, headless);
     assert.equal(removedPane.removed, true);
     const removedWindow = await call("tmux_kill_window", { target: window.id });
     assert.equal(removedWindow.removed, true);
@@ -130,6 +142,11 @@ test("isolated tmux server exercises tools without touching the user's default s
     assert.equal((await call("tmux_list_created")).items[0].live, false);
     assert.equal((await call("tmux_list_sessions")).items[0].tracked, false);
     assert.match(await callError("tmux_kill_session", { target: created.id }), /another or unknown tmux server/);
+    await registry.record({ ...saved, piSessionId: undefined });
+    const survivingPane = (await call("tmux_list_panes", { session: created.id })).items[0].id;
+    assert.match(await callError("tmux_send_key", { target: survivingPane, key: "Enter" }, headless), /confirmation|UI/i);
+    assert.match(await callError("tmux_kill_session", { target: created.id }, headless), /confirmation|UI/i);
+    assert.deepEqual((await call("tmux_list_created")).items, []);
     await registry.record(saved);
     await call("tmux_rename_session", { target: created.id, name: "renamed-session" });
     assert.equal((await call("tmux_inspect_session", { target: created.id })).name, "renamed-session");
@@ -141,7 +158,7 @@ test("isolated tmux server exercises tools without touching the user's default s
     const forgottenChild = await call("tmux_kill_session", { target: childSession.id });
     assert.equal(forgottenChild.forgotten, 1);
     await call("tmux_kill_session", { target: renamedSession.id });
-    await call("tmux_kill_session", { target: created.id });
+    await call("tmux_kill_session", { target: created.id }, headless);
     assert.deepEqual((await call("tmux_list_created")).items, [], "killing tracked sessions clears their registry entries");
     sessions = await call("tmux_list_sessions");
     assert.deepEqual(sessions.items, []);
