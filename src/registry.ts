@@ -2,6 +2,11 @@ import { mkdir, readFile, rename, rm, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import path from "node:path";
 import { TmuxError, errorMessage } from "./tmux.ts";
+import type { LiveTargets } from "./targets.ts";
+
+export function isTrackedLive(entry: RegistryEntry, view: LiveTargets): boolean {
+  return !!entry.serverIdentity && entry.serverIdentity === view.serverIdentity && view.live.has(entry.id);
+}
 
 export type RegistryKind = "session" | "window" | "pane";
 
@@ -26,6 +31,8 @@ export interface RegistryEntry {
   tool: string;
   /** ISO-8601 creation time. */
   createdAt: string;
+  /** Server fingerprint; legacy entries without it are never trusted as live. */
+  serverIdentity?: string;
 }
 
 interface RegistryData {
@@ -114,11 +121,15 @@ export class Registry {
     } catch {
       throw new TmuxError(`The tmux registry at ${this.file} is not valid JSON; refusing to overwrite it. Remove or repair the file to continue.`, "command_failed");
     }
-    const targets = parsed !== null && typeof parsed === "object" ? (parsed as { targets?: unknown }).targets : undefined;
+    if (parsed === null || typeof parsed !== "object" || (parsed as { version?: unknown }).version !== REGISTRY_VERSION) {
+      throw new TmuxError(`Unsupported tmux registry version at ${this.file}; refusing to overwrite it.`, "command_failed");
+    }
+    const targets = (parsed as { targets?: unknown }).targets;
     if (!Array.isArray(targets)) {
       throw new TmuxError(`The tmux registry at ${this.file} has an unexpected shape; refusing to overwrite it.`, "command_failed");
     }
-    return { version: REGISTRY_VERSION, targets: targets.filter(isEntry) };
+    if (!targets.every(isEntry)) throw new TmuxError(`Invalid tmux registry entry at ${this.file}; refusing to overwrite it.`, "command_failed");
+    return { version: REGISTRY_VERSION, targets };
   }
 
   private async mutate(change: (data: RegistryData) => void): Promise<void> {
@@ -152,5 +163,6 @@ function isEntry(value: unknown): value is RegistryEntry {
   return (entry.kind === "session" || entry.kind === "window" || entry.kind === "pane")
     && typeof entry.id === "string" && typeof entry.sessionId === "string"
     && (typeof entry.parentSessionId === "string" || entry.parentSessionId === null)
-    && typeof entry.name === "string" && typeof entry.tool === "string" && typeof entry.createdAt === "string";
+    && typeof entry.name === "string" && typeof entry.tool === "string" && typeof entry.createdAt === "string"
+    && (entry.serverIdentity === undefined || typeof entry.serverIdentity === "string");
 }

@@ -72,6 +72,9 @@ test("isolated tmux server exercises tools without touching the user's default s
     const firstPaneList = await call("tmux_list_panes", { window: window.id });
     assert.equal(firstPaneList.items.length, 1);
     const pane = firstPaneList.items[0].id;
+    const headless = { hasUI: false, ui: {} } as unknown as ExtensionContext;
+    assert.match(await callError("tmux_send_text", { target: pane, text: "echo FORBIDDEN" }, headless), /not approved|confirmation|UI/i);
+    assert.match(await callError("tmux_send_key", { target: pane, key: "Enter" }, headless), /not approved|confirmation|UI/i);
     let paneKillPrompt = "";
     const refuseLastPane = { hasUI: true, ui: { async confirm(title: string) { paneKillPrompt = title; return false; } } } as unknown as ExtensionContext;
     assert.match(await callError("tmux_kill_pane", { target: pane }, refuseLastPane), /not approved/);
@@ -86,7 +89,7 @@ test("isolated tmux server exercises tools without touching the user's default s
     assert.equal(panes.items.length, 2);
     assert.equal((await call("tmux_inspect_pane", { target: split.id })).id, split.id);
 
-    const headlessContext = { hasUI: false, ui: {} } as unknown as ExtensionContext;
+    const headlessContext = headless;
     const probe = await call("tmux_split_pane", { target: split.id, orientation: "vertical", cwd: directory });
     const headlessSend = await call("tmux_send_text", { target: probe.id, text: "echo PI_NO_UI_MARKER" }, headlessContext);
     assert.equal(headlessSend.approved, undefined);
@@ -122,6 +125,12 @@ test("isolated tmux server exercises tools without touching the user's default s
     assert.equal(removedWindow.removed, true);
     assert.equal(removedWindow.forgotten, 2, "killing a window also forgets the window and panes recorded under it");
     assert.deepEqual((await call("tmux_list_created")).items.map((entry: any) => entry.id), [created.id]);
+    const saved = (await registry.list()).find((entry) => entry.id === created.id)!;
+    await registry.record({ ...saved, serverIdentity: "0:0" });
+    assert.equal((await call("tmux_list_created")).items[0].live, false);
+    assert.equal((await call("tmux_list_sessions")).items[0].tracked, false);
+    assert.match(await callError("tmux_kill_session", { target: created.id }), /another or unknown tmux server/);
+    await registry.record(saved);
     await call("tmux_rename_session", { target: created.id, name: "renamed-session" });
     assert.equal((await call("tmux_inspect_session", { target: created.id })).name, "renamed-session");
     const childSession = await call("tmux_create_session", { name: "child", cwd: directory, parent: created.id });

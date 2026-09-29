@@ -11,7 +11,7 @@ import { formatCreated, registerTmuxUi } from "../src/ui.ts";
 const NOW = Date.parse("2026-03-01T12:00:00.000Z");
 const created = (overrides: Partial<RegistryEntry>): RegistryEntry => ({
   kind: "session", id: "$3", sessionId: "$3", parentSessionId: null, name: "pi-test",
-  tool: "tmux_create_session", createdAt: "2026-03-01T11:58:00.000Z", ...overrides,
+  tool: "tmux_create_session", createdAt: "2026-03-01T11:58:00.000Z", serverIdentity: "123:456", ...overrides,
 });
 
 class FakeTmux extends Tmux {
@@ -23,6 +23,7 @@ class FakeTmux extends Tmux {
   capture = "prompt$ \n";
   override async run(args: readonly string[]): Promise<string> {
     this.commands.push([...args]);
+    if (args[0] === "display-message") return "123:456\n";
     if (args[0] === "list-sessions") return this.sessions;
     if (args[0] === "list-windows") return this.windows;
     if (args[0] === "list-panes") return this.panes;
@@ -69,7 +70,7 @@ test("formatCreated names targets readably, orders live ones first, and summaris
     created({ kind: "pane", id: "%1", sessionId: "$3", windowId: "@4", name: "%1" }),
     created({ parentSessionId: "$0" }),
   ];
-  const live = { live: new Set(["$3", "%1"]), labels: new Map([["$3", "pi-test"], ["%1", "pi-test:extra.0"]]) };
+  const live = { live: new Set(["$3", "%1"]), labels: new Map([["$3", "pi-test"], ["%1", "pi-test:extra.0"]]), serverIdentity: "123:456" };
   const lines = formatCreated(entries, live, 2, NOW);
   assert.equal(lines[0], "pi-tmux · 3 created · 1 gone · +1 more (/tmux)");
   assert.equal(lines[1], "● pi-test  session  2m  ← $0");
@@ -78,7 +79,7 @@ test("formatCreated names targets readably, orders live ones first, and summaris
   // A dead target keeps the name it was created with, falls back to its parent's path, and never leaks a bare ID.
   const goneOnly = { live: new Set<string>(), labels: new Map<string, string>() };
   assert.deepEqual(formatCreated([created({ id: "$9", name: "$9" })], goneOnly, 8, NOW), ["pi-tmux · 1 created · 1 gone", "✗ untitled ($9)  session  2m"]);
-  const parentOnly = { live: new Set(["$3"]), labels: new Map([["$3", "pi-test"]]) };
+  const parentOnly = { live: new Set(["$3"]), labels: new Map([["$3", "pi-test"]]), serverIdentity: "123:456" };
   assert.deepEqual(formatCreated([created({ kind: "pane", id: "%1", windowId: "@4", name: "%1" })], parentOnly, 8, NOW), ["pi-tmux · 1 created · 1 gone", "✗ pi-test (%1)  pane  2m"]);
   assert.deepEqual(formatCreated([], goneOnly), []);
   assert.equal(formatCreated(entries, live, 9, NOW)[0], "pi-tmux · 3 created · 1 gone");
@@ -119,7 +120,7 @@ test("/tmux list falls back to a plain notification without UI and hides the wid
       assert.equal(notices.length, 1);
       assert.match(notices[0]!, /pi-tmux · 1 created/);
       assert.match(notices[0]!, /● pi-test  session/);
-      assert.equal(tmux.commands.filter((args) => args[0] === "list-sessions").length, 1);
+      assert.ok(tmux.commands.some((args) => args[0] === "list-sessions"));
 
       await command("off", plainContext(notices));
       assert.match(notices.at(-1)!, /widget hidden/);

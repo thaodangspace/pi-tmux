@@ -1,5 +1,5 @@
 import type { ExtensionAPI, ExtensionCommandContext, ExtensionContext } from "@earendil-works/pi-coding-agent";
-import type { Registry, RegistryEntry, RegistryKind } from "./registry.ts";
+import { isTrackedLive, type Registry, type RegistryEntry, type RegistryKind } from "./registry.ts";
 import type { LiveTargets } from "./targets.ts";
 import { Targets } from "./targets.ts";
 import { Tmux, TmuxError, errorMessage } from "./tmux.ts";
@@ -40,7 +40,8 @@ export function registerTmuxUi(pi: ExtensionAPI, options: TmuxUiOptions): void {
       return;
     }
     try {
-      const lines = formatCreated(await registry.list(), await targets.liveTargets());
+      const entries = await registry.list();
+      const lines = formatCreated(entries, entries.length ? await targets.liveTargets() : { live: new Set(), labels: new Map() });
       ctx.ui.setWidget(WIDGET_KEY, lines.length ? lines : undefined, { placement: "belowEditor" });
     } catch (error) {
       ctx.ui.setWidget(WIDGET_KEY, [`pi-tmux: ${errorMessage(error)}`], { placement: "belowEditor" });
@@ -52,7 +53,7 @@ export function registerTmuxUi(pi: ExtensionAPI, options: TmuxUiOptions): void {
   pi.on("tool_execution_end", (event, ctx) => {
     if (event.toolName.startsWith("tmux_")) return refreshWidget(ctx);
   });
-  pi.on("session_shutdown", (_event, ctx) => { ctx.ui.setWidget(WIDGET_KEY, undefined); });
+  pi.on("session_shutdown", (_event, ctx) => { if (ctx.mode === "tui") ctx.ui.setWidget(WIDGET_KEY, undefined); });
 
   pi.registerCommand("tmux", {
     description: "Show, inspect, or manage the tmux targets Pi created (widget: /tmux on|off, cleanup: /tmux prune)",
@@ -135,6 +136,8 @@ export function registerTmuxUi(pi: ExtensionAPI, options: TmuxUiOptions): void {
   }
 
   async function resolveLive(entry: RegistryEntry): Promise<unknown> {
+    const view = await targets.liveTargets();
+    if (!isTrackedLive(entry, view)) throw new TmuxError(`Refusing ${entry.id}: its provenance does not match this tmux server.`, "invalid_target");
     if (entry.kind === "session") return targets.session(entry.id);
     if (entry.kind === "window") return targets.window(entry.id);
     return targets.pane(entry.id);
@@ -142,6 +145,7 @@ export function registerTmuxUi(pi: ExtensionAPI, options: TmuxUiOptions): void {
 
   /** Captures from the entry itself, or the active pane inside it. */
   async function capture(entry: RegistryEntry, ctx: ExtensionCommandContext): Promise<void> {
+    await resolveLive(entry);
     let paneId = entry.kind === "pane" ? entry.id : undefined;
     if (!paneId) {
       const panes = await targets.panes();
@@ -155,7 +159,7 @@ export function registerTmuxUi(pi: ExtensionAPI, options: TmuxUiOptions): void {
   }
 
   async function switchTo(entry: RegistryEntry, ctx: ExtensionCommandContext): Promise<void> {
-    await targets.session(entry.id); // Revalidate before switching.
+    await resolveLive(entry); // Revalidate provenance before switching.
     const clients = await targets.clients();
     if (!clients.length) throw new TmuxError("No attached tmux client is available; attach a client first.", "invalid_target");
     let client = clients[0]!;
@@ -176,7 +180,7 @@ export function registerTmuxUi(pi: ExtensionAPI, options: TmuxUiOptions): void {
     if (!approved) throw new TmuxError("Action was not approved; no tmux action was taken.", "cancelled");
     await resolveLive(entry); // Revalidate immediately before mutating.
     await options.tmux.run([`kill-${entry.kind}`, "-t", entry.id]);
-    const forgotten = await registry.forget(entry.kind, entry.id, { sessionId: entry.sessionId });
+    const forgotten = await registry.forget(entry.kind, entry.id, { sessionId: entry.sessionId }).catch(() => 0);
     ctx.ui.notify(`pi-tmux: killed ${entry.kind} ${entry.name}; removed ${forgotten} registry entr${forgotten === 1 ? "y" : "ies"}.`, "info");
   }
 
@@ -195,7 +199,7 @@ export function registerTmuxUi(pi: ExtensionAPI, options: TmuxUiOptions): void {
       ctx.ui.notify("pi-tmux: refusing to prune because no tmux sessions/windows/panes are visible (is the server running?).", "warning");
       return;
     }
-    const gone = entries.filter((entry) => !view.live.has(entry.id));
+    const gone = entries.filter((entry) => !isTrackedLive(entry, view));
     if (!gone.length) {
       ctx.ui.notify("pi-tmux: nothing to prune; every recorded target still exists.", "info");
       return;
@@ -207,14 +211,14 @@ export function registerTmuxUi(pi: ExtensionAPI, options: TmuxUiOptions): void {
       ctx.ui.notify("pi-tmux: prune cancelled.", "info");
       return;
     }
-    const removed = await registry.remove((entry) => !view.live.has(entry.id));
+    const removed = await registry.remove((entry) => !isTrackedLive(entry, view));
     ctx.ui.notify(`pi-tmux: pruned ${removed} gone entr${removed === 1 ? "y" : "ies"}.`, "info");
   }
 }
 
 /** The readable name for a target: its live label, the name recorded at creation, or its parent's path keyed by ID. */
 export function labelOf(entry: RegistryEntry, labels: Map<string, string>): string {
-  const live = labels.get(entry.id);
+  const live = entry.serverIdentity ? labels.get(entry.id) : undefined;
   if (live) return live;
   if (entry.name && entry.name !== entry.id) return entry.name;
   const parent = (entry.windowId ? labels.get(entry.windowId) : undefined) ?? labels.get(entry.sessionId);
@@ -228,11 +232,11 @@ export function labelOf(entry: RegistryEntry, labels: Map<string, string>): stri
  */
 export function formatCreated(entries: RegistryEntry[], view: LiveTargets, limit = WIDGET_LIMIT, now = Date.now()): string[] {
   if (!entries.length) return [];
-  const ordered = [...entries].sort((a, b) => ranked(a, view.live) - ranked(b, view.live)
+  const ordered = [...entries].sort((a, b) => ranked(a, view) - ranked(b, view)
     || Date.parse(b.createdAt) - Date.parse(a.createdAt)
     || a.id.localeCompare(b.id));
   const shown = ordered.slice(0, limit).map((entry) => {
-    const marker = view.live.has(entry.id) ? LIVE_MARKER : GONE_MARKER;
+    const marker = isTrackedLive(entry, view) ? LIVE_MARKER : GONE_MARKER;
     // A parent equal to the containing session is already visible in the label path.
     const parent = entry.parentSessionId && entry.parentSessionId !== entry.sessionId
       ? `  ← ${view.labels.get(entry.parentSessionId) ?? entry.parentSessionId}`
@@ -240,19 +244,19 @@ export function formatCreated(entries: RegistryEntry[], view: LiveTargets, limit
     return `${marker} ${labelOf(entry, view.labels)}  ${entry.kind}  ${formatAge(entry.createdAt, now)}${parent}`;
   });
   const hidden = ordered.length - shown.length;
-  const gone = ordered.filter((entry) => !view.live.has(entry.id)).length;
+  const gone = ordered.filter((entry) => !isTrackedLive(entry, view)).length;
   const summary = `pi-tmux · ${ordered.length} created${gone ? ` · ${gone} gone` : ""}${hidden > 0 ? ` · +${hidden} more (/tmux)` : ""}`;
   return [summary, ...shown];
 }
 
-function ranked(entry: RegistryEntry, live: Set<string>): number {
+function ranked(entry: RegistryEntry, view: LiveTargets): number {
   const kindOrder: Record<RegistryKind, number> = { session: 0, window: 1, pane: 2 };
-  return (live.has(entry.id) ? 0 : 10) + kindOrder[entry.kind];
+  return (isTrackedLive(entry, view) ? 0 : 10) + kindOrder[entry.kind];
 }
 
 /** Picker label: readable name first, machine ID last so it stays unambiguous. */
 function describe(entry: RegistryEntry, view: LiveTargets): string {
-  const marker = view.live.has(entry.id) ? LIVE_MARKER : GONE_MARKER;
+  const marker = isTrackedLive(entry, view) ? LIVE_MARKER : GONE_MARKER;
   return `${marker} ${labelOf(entry, view.labels)} (${entry.kind} ${entry.id}) ${formatAge(entry.createdAt, Date.now())}`;
 }
 

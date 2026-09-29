@@ -16,7 +16,7 @@ Read-only tools: `tmux_list_sessions`, `tmux_list_clients`, `tmux_list_windows`,
 
 Structural tools: `tmux_create_session`, `tmux_create_window`, `tmux_rename_session`, `tmux_rename_window`, `tmux_select_session`, `tmux_select_window`, `tmux_split_pane`, `tmux_select_pane`, and `tmux_resize_pane`. New sessions/windows are created detached; new windows and split panes are not selected. Session selection switches an already attached client: the sole client is selected automatically, while multiple clients require a name from `tmux_list_clients`; no client is attached or detached. Selecting a session with no attached client fails clearly. Horizontal split means side-by-side panes (`tmux split-window -h`); vertical means stacked panes.
 
-Input tools: `tmux_send_text` and `tmux_send_key` send literal text or one restricted named key to an explicitly targeted pane. They never require confirmation. Text is sent as literal bytes and never has Enter appended automatically; sending the `Enter` key is a separate call.
+Input tools: `tmux_send_text` and `tmux_send_key` send literal text or one restricted named key to an explicitly targeted pane. Untracked panes require confirmation; panes created through this extension on the current server do not. Text is sent as literal bytes and never has Enter appended automatically; sending the `Enter` key is a separate call.
 
 Guarded tools: `tmux_kill_session`, `tmux_kill_window`, and `tmux_kill_pane`.
 
@@ -34,7 +34,7 @@ tmux has no built-in "created from" metadata, so the extension records every ses
 - Killing through this extension removes the matching entries and reports `forgotten`. Targets killed outside the extension leave stale entries, which `live: false` reveals; the extension never deletes entries it did not create.
 - A corrupt or unexpected registry file is reported and left untouched rather than overwritten.
 
-Caveats: the registry is metadata, not proof of ownership, and it never influences target resolution or naming. Sessions created outside Pi are invisible to it, entries can outlive a server restart, and the file is bounded to the 2,000 most recent entries.
+Caveats: the registry is local metadata, not cryptographic proof of ownership. Server PID and start time prevent stale entries from being treated as live after a server restart; older entries without an identity are treated as gone. Sessions created outside Pi are invisible to it. The file is bounded to the 2,000 most recent entries.
 
 ## TUI: seeing what Pi created
 
@@ -60,7 +60,7 @@ The picker uses Pi's built-in selector dialogs (`ctx.ui.select`/`confirm`), so t
 
 ## Confirmation and data safety
 
-Every kill requires explicit UI confirmation naming the operation and target. Sending input to a pane — literal text or a named key — is always allowed and is never confirmed. Confirmation warns that killing a last pane also removes its window, and killing a last window also removes its session. If confirmation is refused, cancelled, unavailable, or fails, the kill does not run. Pi modes without confirmation UI therefore retain read-only, structural, and input tools but cannot use the kill tools. Targets are checked again before every mutation. Never assume a user-provided script or destructive action is safe merely because it is sent as “literal” text: sending input can still execute commands.
+Every kill requires explicit UI confirmation naming the operation and target. Sending input to an untracked pane requires UI confirmation; input to a pane created by this extension on the current server does not. Confirmation warns that killing a last pane also removes its window, and killing a last window also removes its session. If confirmation is refused, cancelled, unavailable, or fails, the kill does not run. Pi modes without confirmation UI retain read-only and structural tools, and can send input only to tracked panes; they cannot use kill tools. Targets are checked again before every mutation. Never assume a user-provided script or destructive action is safe merely because it is sent as “literal” text: sending input can still execute commands.
 
 Pane capture is a plain-text **snapshot**, not a command result. It cannot prove that a process completed or succeeded. Capture includes the visible screen and optionally up to 5,000 recent scrollback lines, but only the most recent 3,000 lines / 40,000 bytes are returned. Truncation is reported. Alternate-screen content and partial output have the usual tmux capture limitations. Pane content can include credentials or other secrets; captured content is shared with the model. Capture output is never logged by the extension.
 

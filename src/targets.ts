@@ -38,6 +38,7 @@ export interface PaneTarget {
 export interface LiveTargets {
   live: Set<string>;
   labels: Map<string, string>;
+  serverIdentity?: string;
 }
 
 const SESSION_FORMAT = "#{session_id}\t#{session_name}\t#{session_attached}\t#{session_windows}";
@@ -47,6 +48,14 @@ const CLIENT_FORMAT = "#{client_name}\t#{session_id}\t#{client_tty}";
 
 export class Targets {
   constructor(readonly tmux: Tmux) {}
+
+  async serverIdentity(signal?: AbortSignal): Promise<string | undefined> {
+    const sessions = await this.sessions(signal);
+    if (!sessions.length) return undefined;
+    const value = (await this.tmux.run(["display-message", "-p", "-t", sessions[0]!.id, "#{pid}:#{start_time}"], { signal })).trim();
+    if (!/^\d+:\d+$/.test(value)) throw new TmuxError("tmux returned an invalid server identity.", "command_failed");
+    return value;
+  }
 
   async sessions(signal?: AbortSignal): Promise<SessionTarget[]> {
     const output = await listOrEmpty(this.tmux, ["list-sessions", "-F", SESSION_FORMAT], signal);
@@ -124,7 +133,7 @@ export class Targets {
       live.add(pane.id);
       labels.set(pane.id, `${pane.sessionName}:${pane.windowName}.${pane.index}`);
     }
-    return { live, labels };
+    return { live, labels, serverIdentity: sessions.length ? await this.serverIdentity(signal) : undefined };
   }
 }
 
@@ -132,7 +141,7 @@ async function listOrEmpty(tmux: Tmux, args: string[], signal?: AbortSignal): Pr
   try {
     return await tmux.run(args, { signal });
   } catch (error) {
-    if (error instanceof TmuxError && /no server running|no sessions|no clients|no current target/i.test(error.message)) return "";
+    if (error instanceof TmuxError && (error.code === "unavailable" || /no server running|no sessions|no clients|no current target|error connecting to .*No such file or directory/i.test(error.message))) return "";
     throw error;
   }
 }
