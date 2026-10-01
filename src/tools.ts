@@ -6,6 +6,7 @@ import { confirmMutation } from "./confirm.ts";
 import { GenericSubagentController } from "./generic-subagent.ts";
 import { assertSamePlacement, checkOwnership } from "./ownership.ts";
 import { ClaudeCodeAdapter } from "./claude-adapter.ts";
+import { OpenCodeAdapter } from "./opencode-adapter.ts";
 import { PiAdapter } from "./pi-adapter.ts";
 import {
   type PiSubagentControllerOptions,
@@ -253,7 +254,7 @@ export function registerTmuxTools(pi: ExtensionAPI, tmux = new Tmux(), registry 
   // These are the preferred surface: they name no agent and expose no
   // executable/argv/shell field. `tmux_subagent_start_pi` and the `jobId` form of
   // status/cancel remain as the compatibility path for the one-shot Pi job API.
-  register({ name: "tmux_subagent_create", label: "Create subagent session", description: "Create a reusable, agent-neutral subagent session owned by this Pi conversation, bound to a dedicated detached tmux session. Starts no turn; use tmux_subagent_run afterwards. The agent must be one whose adapter is configured (pi or claude-code by default, or an opencode runner supplied by deployer config). No executable or argv is accepted.", promptSnippet: "Create a reusable subagent session", parameters: Type.Object({
+  register({ name: "tmux_subagent_create", label: "Create subagent session", description: "Create a reusable, agent-neutral subagent session owned by this Pi conversation, bound to a dedicated detached tmux session. Starts no turn; use tmux_subagent_run afterwards. The agent must be one whose adapter is configured (pi, claude-code, or opencode by default; a deployer runner spec may override one). No executable or argv is accepted.", promptSnippet: "Create a reusable subagent session", parameters: Type.Object({
     agent: Type.Union(SUBAGENT_AGENTS.map((agent) => Type.Literal(agent))),
     cwd: Type.String({ minLength: 1, description: "Absolute, existing working directory for the child." }),
     name: Type.Optional(SAFE_NAME),
@@ -483,15 +484,15 @@ export function subagentFailure(operation: string, outcome: SubagentFailure) {
 }
 
 /**
- * Builds the default agent adapter registry: a Pi adapter, a first-class Claude
- * Code adapter, plus one config-driven runner adapter per `agentSpecs` (or
- * `PI_TMUX_AGENT_SPECS`) entry. A deployer spec for an agent overrides the
- * built-in adapter of the same name. A malformed spec is skipped so a bad
- * deployer configuration cannot break Pi; the agent then simply reports that no
- * adapter is registered.
+ * Builds the default agent adapter registry: a Pi adapter, first-class Claude
+ * Code and OpenCode adapters, plus one config-driven runner adapter per
+ * `agentSpecs` (or `PI_TMUX_AGENT_SPECS`) entry. A deployer spec for an agent
+ * overrides the built-in adapter of the same name. A malformed spec is skipped
+ * so a bad deployer configuration cannot break Pi; the agent then simply reports
+ * that no adapter is registered.
  */
 function buildDefaultAdapters(options: TmuxToolOptions): AgentAdapterRegistry {
-  const adapters = new AgentAdapterRegistry([new PiAdapter(options.piSubagent), new ClaudeCodeAdapter()]);
+  const adapters = new AgentAdapterRegistry([new PiAdapter(options.piSubagent), new ClaudeCodeAdapter(), new OpenCodeAdapter()]);
   const specs = { ...readAgentSpecsFromEnv(), ...(options.agentSpecs ?? {}) };
   for (const [agent, spec] of Object.entries(specs)) {
     if (!spec || !SUBAGENT_AGENTS.includes(agent as SubagentAgent)) continue;
