@@ -2,7 +2,7 @@
 
 - Issue: https://github.com/thaodangspace/pi-tmux/issues/15
 - Branch: `issue-15-interactive`
-- PR: (pending)
+- PR: https://github.com/thaodangspace/pi-tmux/pull/22
 - Base: `origin/main` (includes #9/#10/#11/#12/#13/#14)
 
 ## What was implemented
