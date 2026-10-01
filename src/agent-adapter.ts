@@ -96,6 +96,37 @@ export type AgentCompletionStrategy =
   | { strategy: "runner" };
 
 /**
+ * Everything an adapter needs to build an interactive (TUI) launch spec. This
+ * carries no task: an interactive session runs the agent's own terminal UI and
+ * is never driven by a structured turn.
+ */
+export interface AgentInteractiveContext {
+  agent: SubagentAgent;
+  /** The owning Pi conversation; never another parent's session. */
+  owner: string;
+  /** Absolute, existing working directory for the child. */
+  cwd: string;
+  /** Resolved values from `preflightInteractive` (e.g. a resolved executable path). */
+  preflight: Readonly<Record<string, string>>;
+  /** This process's environment. */
+  env: NodeJS.ProcessEnv;
+  signal?: AbortSignal;
+}
+
+/**
+ * The constant command plus environment tmux applies to start an interactive
+ * agent TUI. Like {@link AgentLaunchSpec}.command it must only reference
+ * constants and quoted environment variables and must never contain caller text.
+ * There is no completion strategy: interactive liveness is process liveness.
+ */
+export interface AgentInteractiveLaunchSpec {
+  /** Constant shell command tmux runs; no caller-provided text is interpolated. */
+  command: string;
+  /** Environment values set on the pane before the command runs. */
+  env: Record<string, string>;
+}
+
+/**
  * The constant command plus environment tmux applies for one turn. `command`
  * must only reference constants and quoted environment variables; it must never
  * contain the task or any other caller-provided text.
@@ -143,6 +174,26 @@ export interface AgentAdapter {
    * MUST NOT interpolate caller text; carry the task as an environment value.
    */
   prepareTurn(input: SubagentTurnOptions, context: AgentTurnContext): Promise<AgentLaunchSpec>;
+
+  /**
+   * Whether this adapter can run a persistent interactive TUI (issue #15). When
+   * true, both `preflightInteractive` and `prepareInteractive` must be present.
+   * Defaults to false so an agent that has no defined TUI contract is rejected
+   * rather than guessed.
+   */
+  readonly supportsInteractive?: boolean;
+
+  /**
+   * Agent-specific executable resolution for interactive mode. It is separate
+   * from `preflight` because an interactive TUI does not use the turn runner.
+   */
+  preflightInteractive?(input: SubagentTurnOptions): Promise<AgentPreflightResult>;
+
+  /**
+   * Builds the constant TUI launch command and environment. MUST NOT
+   * interpolate caller text.
+   */
+  prepareInteractive?(input: SubagentTurnOptions, context: AgentInteractiveContext): Promise<AgentInteractiveLaunchSpec>;
 }
 
 /**

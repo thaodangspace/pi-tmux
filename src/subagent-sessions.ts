@@ -32,7 +32,19 @@ export const SUBAGENT_TURN_VERSION = 1 as const;
 export const SUBAGENT_AGENTS = ["pi", "claude-code", "opencode"] as const;
 export type SubagentAgent = (typeof SUBAGENT_AGENTS)[number];
 
-export const SUBAGENT_SESSION_STATUSES = ["starting", "idle", "busy", "stopped", "lost"] as const;
+/**
+ * Execution mode of a logical subagent session (issue #15).
+ *
+ * - `turns` (default): structured, resumable one-turn-at-a-time runs. This is
+ *   the orchestration protocol automated workflows depend on.
+ * - `interactive`: a long-lived agent TUI runs in the owned tmux pane. Liveness
+ *   is tmux/process liveness; no turn is ever completed, and completion is never
+ *   inferred from pane text.
+ */
+export const SUBAGENT_SESSION_MODES = ["turns", "interactive"] as const;
+export type SubagentSessionMode = (typeof SUBAGENT_SESSION_MODES)[number];
+
+export const SUBAGENT_SESSION_STATUSES = ["starting", "idle", "busy", "interactive", "stopped", "lost"] as const;
 export type SubagentSessionStatus = (typeof SUBAGENT_SESSION_STATUSES)[number];
 export type TerminalSubagentSessionStatus = "stopped" | "lost";
 
@@ -60,9 +72,12 @@ export function isActiveTurnStatus(status: SubagentTurnStatus): boolean {
  * from turn state where required (see `transitionSession`).
  */
 const SESSION_TRANSITIONS: Record<SubagentSessionStatus, readonly SubagentSessionStatus[]> = {
-  starting: ["idle", "busy", "stopped", "lost"],
+  starting: ["idle", "busy", "interactive", "stopped", "lost"],
   idle: ["busy", "stopped", "lost"],
   busy: ["idle", "stopped", "lost"],
+  // An interactive session is a persistent TUI. It never runs turns and can only
+  // be stopped or reconciled to lost.
+  interactive: ["stopped", "lost"],
   stopped: [],
   lost: [],
 };
@@ -90,8 +105,19 @@ export interface SubagentSessionV1 {
   parentPiSessionId: string | null;
   cwd: string;
   status: SubagentSessionStatus;
+  /**
+   * How this session executes. `turns` (default) runs structured turns; an
+   * `interactive` session runs one long-lived agent TUI in the owned pane.
+   * Absent on older records is read as `turns`.
+   */
+  mode?: SubagentSessionMode;
   /** Stable tmux session ID (`$N`) owned by this logical subagent, or null until bound. */
   tmuxSessionId: string | null;
+  /**
+   * Stable tmux pane ID (`%N`) that runs an interactive TUI, or null. Turns
+   * sessions leave this null because each turn owns its own pane.
+   */
+  tmuxPaneId?: string | null;
   /** tmux server fingerprint (`pid:start_time`) the target belonged to when bound. */
   serverIdentity?: string;
   /** Native Claude/OpenCode/Pi conversation id, stored after the first turn so later turns resume it. */
@@ -138,10 +164,14 @@ export interface CreateSubagentSessionInput {
   agent: SubagentAgent;
   cwd: string;
   parentPiSessionId: string | null;
+  /** Execution mode; defaults to `turns`. */
+  mode?: SubagentSessionMode;
 }
 
 export interface BindSubagentSessionInput {
   tmuxSessionId: string;
+  /** Stable pane that runs the interactive TUI (interactive sessions only). */
+  tmuxPaneId?: string;
   serverIdentity?: string;
 }
 
@@ -261,6 +291,10 @@ export class SubagentSessionRegistry {
     if (!(parentPiSessionId === null || (typeof parentPiSessionId === "string" && parentPiSessionId.length > 0))) {
       throw new TmuxError("parentPiSessionId must be a non-empty string or null.", "invalid_option");
     }
+    const mode = input.mode ?? "turns";
+    if (!SUBAGENT_SESSION_MODES.includes(mode)) {
+      throw new TmuxError(`mode must be one of ${SUBAGENT_SESSION_MODES.join(", ")}.`, "invalid_option");
+    }
     return this.mutate((state) => {
       if (state.sessions.length >= this.maxSessions) {
         throw new TmuxError(
@@ -278,7 +312,9 @@ export class SubagentSessionRegistry {
         parentPiSessionId,
         cwd,
         status: "starting",
+        mode,
         tmuxSessionId: null,
+        tmuxPaneId: null,
         createdAt: at,
         updatedAt: at,
       };
@@ -295,6 +331,7 @@ export class SubagentSessionRegistry {
   async bindSession(sessionId: string, input: BindSubagentSessionInput, options: SessionMutationOptions = {}): Promise<SubagentSessionV1> {
     assertSessionId(sessionId);
     const tmuxSessionId = requireStableId(input?.tmuxSessionId, SESSION_ID, "tmuxSessionId");
+    const tmuxPaneId = input.tmuxPaneId === undefined ? undefined : requireStableId(input.tmuxPaneId, PANE_ID, "tmuxPaneId");
     const serverIdentity = input.serverIdentity;
     if (serverIdentity !== undefined && (typeof serverIdentity !== "string" || serverIdentity.length === 0)) {
       throw new TmuxError("serverIdentity must be a non-empty string when provided.", "invalid_option");
@@ -306,8 +343,9 @@ export class SubagentSessionRegistry {
       if (isTerminalSessionStatus(session.status)) {
         throw new TmuxError(`Session ${sessionId} is already terminal (${session.status}); it cannot bind a tmux target.`, "invalid_option");
       }
+      const boundPane = session.tmuxPaneId ?? null;
       if (session.tmuxSessionId !== null) {
-        if (session.tmuxSessionId === tmuxSessionId) return { ...session };
+        if (session.tmuxSessionId === tmuxSessionId && (tmuxPaneId === undefined || boundPane === tmuxPaneId)) return { ...session };
         throw new TmuxError(`Session ${sessionId} is already bound to ${session.tmuxSessionId}.`, "invalid_option");
       }
       if (session.status !== "starting" && session.status !== "idle") {
@@ -317,7 +355,14 @@ export class SubagentSessionRegistry {
       if (clash) {
         throw new TmuxError(`tmux session ${tmuxSessionId} is already bound to active session ${clash.sessionId}; refusing to reuse a live tmux ID.`, "invalid_option");
       }
+      if (tmuxPaneId !== undefined) {
+        const paneClash = state.sessions.find((other) => other.sessionId !== sessionId && !isTerminalSessionStatus(other.status) && (other.tmuxPaneId ?? null) === tmuxPaneId);
+        if (paneClash) {
+          throw new TmuxError(`tmux pane ${tmuxPaneId} is already bound to active session ${paneClash.sessionId}; refusing to reuse a live tmux ID.`, "invalid_option");
+        }
+      }
       session.tmuxSessionId = tmuxSessionId;
+      if (tmuxPaneId !== undefined) session.tmuxPaneId = tmuxPaneId;
       if (serverIdentity !== undefined) session.serverIdentity = serverIdentity;
       session.updatedAt = at;
       return { ...session };
@@ -347,6 +392,18 @@ export class SubagentSessionRegistry {
       }
       if (status === "busy") {
         throw new TmuxError(`Session ${sessionId} becomes "busy" only by starting a turn, not by an explicit transition.`, "invalid_option");
+      }
+      const mode = session.mode ?? "turns";
+      if (status === "interactive") {
+        if (mode !== "interactive") {
+          throw new TmuxError(`Session ${sessionId} is a turns session; it cannot become interactive.`, "invalid_option");
+        }
+        if (state.turns.some((turn) => turn.sessionId === sessionId)) {
+          throw new TmuxError(`Session ${sessionId} already has turns; an interactive session never runs turns.`, "invalid_option");
+        }
+      }
+      if (mode === "interactive" && status === "idle") {
+        throw new TmuxError(`Session ${sessionId} is an interactive session and never becomes idle.`, "invalid_option");
       }
       if (status === "idle" && hasActiveTurn(state, sessionId)) {
         throw new TmuxError(`Session ${sessionId} has an active turn and cannot be marked idle.`, "invalid_option");
@@ -412,6 +469,9 @@ export class SubagentSessionRegistry {
     return this.mutate((state) => {
       const session = findSession(state, sessionId);
       assertOwner(session, options.parentPiSessionId);
+      if ((session.mode ?? "turns") === "interactive") {
+        throw new TmuxError(`Session ${sessionId} is interactive and never runs turns; close it instead.`, "invalid_option");
+      }
       if (isTerminalSessionStatus(session.status)) {
         throw new TmuxError(`Session ${sessionId} is ${session.status}; it cannot start another turn.`, "invalid_option");
       }
@@ -655,10 +715,12 @@ export class SubagentSessionRegistry {
       for (const session of state.sessions) {
         if (isTerminalSessionStatus(session.status)) continue;
         if (owner !== undefined && session.parentPiSessionId !== owner) continue;
-        const targetId = session.tmuxSessionId;
-        if (targetId !== null) {
+        // An interactive session's TUI lives in its bound pane, so a vanished
+        // pane is as fatal as a vanished session. Turns sessions have no pane.
+        const targetIds = [session.tmuxSessionId, session.tmuxPaneId ?? null].filter((id): id is string => id !== null);
+        if (targetIds.length > 0) {
           const identityLost = view.serverIdentity !== undefined && session.serverIdentity !== undefined && session.serverIdentity !== view.serverIdentity;
-          if (identityLost || !view.live.has(targetId)) {
+          if (identityLost || targetIds.some((id) => !view.live.has(id))) {
             session.status = "lost";
             session.updatedAt = at;
             changedSessions.push({ ...session });
@@ -801,7 +863,9 @@ export function legacyJobToSessionAndTurn(job: SubagentJobV1): { session: Subage
     parentPiSessionId: job.parentPiSessionId,
     cwd: job.cwd,
     status: legacySessionStatus(job),
+    mode: "turns",
     tmuxSessionId: job.tmuxSessionId,
+    tmuxPaneId: null,
     ...(job.serverIdentity ? { serverIdentity: job.serverIdentity } : {}),
     createdAt: job.createdAt,
     updatedAt,
@@ -960,7 +1024,9 @@ function isSession(value: unknown): value is SubagentSessionV1 {
   if (!(typeof session.parentPiSessionId === "string" || session.parentPiSessionId === null)) return false;
   if (typeof session.cwd !== "string" || !session.cwd) return false;
   if (typeof session.status !== "string" || !SUBAGENT_SESSION_STATUSES.includes(session.status as SubagentSessionStatus)) return false;
+  if (session.mode !== undefined && (typeof session.mode !== "string" || !SUBAGENT_SESSION_MODES.includes(session.mode as SubagentSessionMode))) return false;
   if (!(typeof session.tmuxSessionId === "string" || session.tmuxSessionId === null)) return false;
+  if (session.tmuxPaneId !== undefined && !(typeof session.tmuxPaneId === "string" || session.tmuxPaneId === null)) return false;
   if (session.serverIdentity !== undefined && (typeof session.serverIdentity !== "string" || !session.serverIdentity)) return false;
   if (session.agentSessionId !== undefined && (typeof session.agentSessionId !== "string" || !session.agentSessionId)) return false;
   if (typeof session.createdAt !== "string" || !Number.isFinite(Date.parse(session.createdAt))) return false;

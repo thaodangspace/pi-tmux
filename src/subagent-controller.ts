@@ -4,7 +4,7 @@ import path from "node:path";
 import type { AgentAdapter, AgentTurnContext, SubagentTurnOptions } from "./agent-adapter.ts";
 import type { Registry } from "./registry.ts";
 import type { LiveTargets, PaneTarget, SessionTarget } from "./targets.ts";
-import { isTerminalSessionStatus, type SubagentAgent, type SubagentSessionStatus } from "./subagent-sessions.ts";
+import { isTerminalSessionStatus, type SubagentAgent, type SubagentSessionMode, type SubagentSessionStatus } from "./subagent-sessions.ts";
 import { Tmux, TmuxError, errorMessage } from "./tmux.ts";
 
 /**
@@ -75,7 +75,11 @@ export interface SubagentSessionInfo {
   owner: string | null;
   cwd: string;
   status: SubagentSessionStatus;
+  /** `turns` (default) or `interactive`. */
+  mode: SubagentSessionMode;
   tmuxSessionId: string | null;
+  /** Stable pane running an interactive TUI, or null for a turns session. */
+  tmuxPaneId: string | null;
   serverIdentity?: string;
   agentSessionId?: string;
 }
@@ -89,6 +93,8 @@ export interface CreateSubagentRunInput {
   agent: SubagentAgent;
   cwd: string;
   owner: string;
+  /** Execution mode for a session ledger; defaults to `turns`. */
+  mode?: SubagentSessionMode;
 }
 
 export interface BindSubagentRunInput {
@@ -120,7 +126,7 @@ export interface SubagentLedger {
   createRun?(input: CreateSubagentRunInput): Promise<SubagentRunRecord>;
   /** Session ledgers create the logical session, bind it, then create each turn. */
   createSession?(input: CreateSubagentRunInput): Promise<SubagentSessionInfo>;
-  bindSession?(sessionId: string, input: { tmuxSessionId: string; serverIdentity?: string }, owner?: string): Promise<void>;
+  bindSession?(sessionId: string, input: { tmuxSessionId: string; tmuxPaneId?: string; serverIdentity?: string }, owner?: string): Promise<void>;
   createTurn?(sessionId: string, owner?: string): Promise<SubagentRunRecord>;
   getSession?(sessionId: string): Promise<SubagentSessionInfo | undefined>;
   stopSession?(sessionId: string, owner?: string): Promise<void>;
@@ -202,7 +208,11 @@ export interface SubagentCreateSuccess {
   sessionId: string;
   agent: SubagentAgent;
   status: SubagentSessionStatus;
+  /** `turns` (default) or `interactive`. */
+  mode: SubagentSessionMode;
   tmuxSessionId: string;
+  /** Stable pane running an interactive TUI (interactive sessions only). */
+  tmuxPaneId?: string;
   name: string;
   cwd: string;
   owner: string;
@@ -313,6 +323,9 @@ export class SubagentController {
     if (!session) return fail("invalid_target", `Unknown subagent session ${JSON.stringify(sessionId)}.`);
     if (session.owner !== null && session.owner !== owner) {
       return fail("invalid_target", `Subagent session ${sessionId} belongs to another Pi conversation; refusing to control it.`);
+    }
+    if (session.mode === "interactive" || session.status === "interactive") {
+      return fail("invalid_option", `Subagent session ${sessionId} is interactive and does not run turns; interact through its tmux pane or close it.`);
     }
     const pre = this.validateCommon(input, owner);
     if (!pre.ok) return pre.failure;
@@ -443,7 +456,165 @@ export class SubagentController {
       sessionId: created.sessionId,
       agent: bound.agent,
       status: bound.status,
+      mode: bound.mode,
       tmuxSessionId,
+      ...(bound.tmuxPaneId ? { tmuxPaneId: bound.tmuxPaneId } : {}),
+      name,
+      cwd,
+      owner,
+      serverIdentity,
+      ...(preflight.metadata ? { metadata: preflight.metadata } : {}),
+    };
+  }
+
+  /**
+   * Provisions a reusable interactive session (issue #15): a logical subagent
+   * session whose execution boundary is one long-lived agent TUI in an owned
+   * detached tmux pane.
+   *
+   * Liveness is process/tmux liveness. No turn is created, no completion is ever
+   * fabricated from pane text, and the session transitions `starting ->
+   * interactive` only after the TUI survives the bounded startup probe. The
+   * adapter must declare `supportsInteractive`; otherwise the request is refused
+   * rather than guessed.
+   */
+  async createInteractiveSession(input: SubagentTurnOptions & { agent: SubagentAgent }, owner: string, signal?: AbortSignal): Promise<SubagentCreateResult> {
+    if (this.ledger.kind !== "session" || this.ledger.tmuxStrategy !== "host-window" || !this.ledger.createSession || !this.ledger.bindSession || !this.ledger.getSession) {
+      return fail("invalid_option", "This agent does not support reusable sessions.");
+    }
+    if (!this.adapter.supportsInteractive || !this.adapter.preflightInteractive || !this.adapter.prepareInteractive) {
+      return fail("invalid_option", `The ${this.adapter.agent} adapter does not support interactive mode; use mode "turns".`);
+    }
+    if (typeof owner !== "string" || !owner) return fail("invalid_option", "A non-empty parent Pi session id is required.");
+    let cwd: string;
+    try {
+      cwd = await validateCwd(input?.cwd);
+    } catch (error) {
+      return fail(codeOf(error), errorMessage(error));
+    }
+    if (input.name !== undefined) {
+      const nameError = validateSubagentName(input.name);
+      if (nameError) return fail("invalid_option", nameError);
+    }
+    const optionsError = this.adapter.validateOptions?.(input);
+    if (optionsError) return fail("invalid_option", optionsError);
+    const ancestors = this.lineage();
+    if (ancestors.length > this.maxDepth) {
+      return fail("invalid_option", `Refusing to delegate: the subagent chain already has ${ancestors.length} jobs (max ${this.maxDepth}).`);
+    }
+
+    let created: SubagentSessionInfo;
+    try {
+      created = await this.ledger.createSession({ agent: input.agent ?? this.adapter.agent, cwd, owner, mode: "interactive" });
+    } catch (error) {
+      return fail(codeOf(error), errorMessage(error));
+    }
+
+    const preflight = await this.adapter.preflightInteractive(input);
+    if (!preflight.ok) {
+      await this.ledger.stopSession?.(created.sessionId, owner).catch(() => undefined);
+      return { ok: false, code: preflight.code, error: preflight.error, sessionId: created.sessionId };
+    }
+
+    let parentSessionId: string | null;
+    try {
+      parentSessionId = input.parent ? (await this.targets.session(input.parent, signal)).id : await detectParentSession(this.tmux, this.env, signal);
+    } catch (error) {
+      await this.ledger.stopSession?.(created.sessionId, owner).catch(() => undefined);
+      return { ok: false, code: codeOf(error), error: `Could not resolve the parent tmux session: ${errorMessage(error)}`, sessionId: created.sessionId };
+    }
+
+    const name = sessionName(input.name, created.sessionId, this.adapter.sessionNamePrefix ?? `${this.adapter.agent}-subagent`);
+    let tmuxSessionId: string;
+    let paneId: string;
+    try {
+      [tmuxSessionId, paneId] = await this.createInertSession(name, cwd, signal);
+    } catch (error) {
+      await this.ledger.stopSession?.(created.sessionId, owner).catch(() => undefined);
+      return { ok: false, code: codeOf(error), error: `Could not create the subagent tmux session: ${errorMessage(error)}`, sessionId: created.sessionId, cleanedUp: true };
+    }
+
+    const serverIdentity = await this.serverIdentity();
+    if (!serverIdentity) {
+      const cleanedUp = await this.cleanupSession(tmuxSessionId, signal);
+      await this.ledger.stopSession?.(created.sessionId, owner).catch(() => undefined);
+      return {
+        ok: false, code: "unavailable",
+        error: "Could not determine the tmux server identity; refusing to create a subagent session that close could not verify. Check that the tmux server is reachable.",
+        sessionId: created.sessionId, cleanedUp,
+      };
+    }
+
+    await this.recordProvenance(tmuxSessionId, parentSessionId, name, cwd, owner, serverIdentity);
+
+    // Prepare the constant TUI command before binding so a bad option cannot
+    // leave a bound-but-unlaunchable session behind.
+    let spec: { command: string; env: Record<string, string> };
+    try {
+      spec = await this.adapter.prepareInteractive(input, {
+        agent: this.adapter.agent,
+        owner,
+        cwd,
+        preflight: preflight.env,
+        env: this.env,
+        signal,
+      });
+    } catch (error) {
+      const cleanedUp = await this.cleanupSession(tmuxSessionId, signal);
+      await this.ledger.stopSession?.(created.sessionId, owner).catch(() => undefined);
+      const message = `Could not prepare the interactive launch: ${errorMessage(error)}`;
+      return { ok: false, code: codeOf(error), error: message, sessionId: created.sessionId, cleanedUp };
+    }
+
+    try {
+      await this.ledger.bindSession(created.sessionId, { tmuxSessionId, tmuxPaneId: paneId, serverIdentity }, owner);
+    } catch (error) {
+      const cleanedUp = await this.cleanupSession(tmuxSessionId, signal);
+      await this.ledger.stopSession?.(created.sessionId, owner).catch(() => undefined);
+      const message = `Could not bind the subagent session to its tmux target: ${errorMessage(error)}`;
+      return { ok: false, code: codeOf(error), error: message, sessionId: created.sessionId, cleanedUp };
+    }
+
+    const env = { ...preflight.env, ...spec.env };
+    const launchArgs = [
+      "respawn-pane", "-k", "-t", paneId,
+      ...Object.entries(env).flatMap(([key, value]) => ["-e", `${key}=${value}`]),
+      spec.command,
+    ];
+    try {
+      await this.tmux.run(launchArgs, { signal });
+    } catch (error) {
+      const cleanedUp = await this.cleanupSession(tmuxSessionId, signal);
+      await this.ledger.stopSession?.(created.sessionId, owner).catch(() => undefined);
+      const message = `Could not start the interactive ${this.adapter.agent} TUI: ${errorMessage(error)}`;
+      return { ok: false, code: codeOf(error), error: message, sessionId: created.sessionId, cleanedUp };
+    }
+
+    const alive = await this.probeStartup(paneId, signal);
+    if (!alive) {
+      const cleanedUp = await this.cleanupSession(tmuxSessionId, signal);
+      await this.ledger.stopSession?.(created.sessionId, owner).catch(() => undefined);
+      const message = `The interactive ${this.adapter.agent} TUI exited during startup; the tmux session was cleaned up.`;
+      return { ok: false, code: "command_failed", error: message, sessionId: created.sessionId, status: "failed", cleanedUp };
+    }
+
+    try {
+      await this.ledger.transitionSession?.(created.sessionId, "interactive", owner);
+    } catch (error) {
+      const cleanedUp = await this.cleanupSession(tmuxSessionId, signal);
+      await this.ledger.stopSession?.(created.sessionId, owner).catch(() => undefined);
+      const message = `Could not mark the interactive session active: ${errorMessage(error)}`;
+      return { ok: false, code: codeOf(error), error: message, sessionId: created.sessionId, cleanedUp };
+    }
+
+    return {
+      ok: true,
+      sessionId: created.sessionId,
+      agent: created.agent,
+      status: "interactive",
+      mode: "interactive",
+      tmuxSessionId,
+      tmuxPaneId: paneId,
       name,
       cwd,
       owner,
@@ -517,6 +688,9 @@ export class SubagentController {
     const session = await this.ledger.getSession(sessionId).catch(() => undefined);
     if (!session) return fail("invalid_target", `Unknown subagent session ${JSON.stringify(sessionId)}.`, { sessionId });
     if (session.owner !== owner) return fail("invalid_target", `Subagent session ${sessionId} belongs to another Pi conversation; refusing to control it.`, { sessionId });
+    if (session.mode === "interactive" || session.status === "interactive") {
+      return fail("invalid_option", `Subagent session ${sessionId} is interactive and has no turns to cancel; use tmux_subagent_close to stop it.`, { sessionId });
+    }
 
     const turns = await this.ledger.listTurns(sessionId);
     let turn: SubagentRunRecord | undefined;

@@ -150,7 +150,7 @@ test("the generic session/turn tools are registered with bounded schemas and no 
     for (const forbidden of ["executable", "argv", "command", "shell", "args"]) {
       assert.equal(fields.has(forbidden), false, `create must not expose ${forbidden}`);
     }
-    assert.deepEqual([...fields].sort(), ["agent", "cwd", "model", "name", "parent", "thinking"]);
+    assert.deepEqual([...fields].sort(), ["agent", "cwd", "mode", "model", "name", "parent", "thinking"]);
   } finally {
     await h.close();
   }

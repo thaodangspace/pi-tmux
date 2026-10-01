@@ -1,6 +1,8 @@
 import path from "node:path";
 import {
   type AgentAdapter,
+  type AgentInteractiveContext,
+  type AgentInteractiveLaunchSpec,
   type AgentLaunchSpec,
   type AgentPreflightResult,
   type AgentTurnContext,
@@ -46,6 +48,12 @@ export const CLAUDE_SUBAGENT_ENV = {
   bin: "PI_TMUX_CLAUDE_BIN",
 } as const;
 
+/** Environment variables carried into an interactive Claude Code TUI launch. */
+export const CLAUDE_INTERACTIVE_ENV = {
+  /** Optional validated model selection for the TUI. */
+  model: "PI_TMUX_CLAUDE_INTERACTIVE_MODEL",
+} as const;
+
 export const DEFAULT_CLAUDE_COMMAND = "claude";
 export const CLAUDE_CODE_PLACEHOLDER_COMMAND = "exec sleep 3600";
 /** The environment variable whose presence changes Claude Code billing. */
@@ -89,6 +97,7 @@ export class ClaudeCodeAdapter implements AgentAdapter {
   readonly sessionNamePrefix = "claude-code-subagent";
   readonly provenanceTool = "tmux_subagent_start_claude-code";
   readonly placeholderCommand = CLAUDE_CODE_PLACEHOLDER_COMMAND;
+  readonly supportsInteractive = true;
 
   private readonly resolveClaude: (command: string) => Promise<string | undefined>;
   private readonly claudeCommand: string;
@@ -117,19 +126,9 @@ export class ClaudeCodeAdapter implements AgentAdapter {
   }
 
   async preflight(_input: SubagentTurnOptions): Promise<AgentPreflightResult> {
-    if (path.isAbsolute(this.claudeCommand) && !(await isFile(this.claudeCommand))) {
-      return { ok: false, code: "unavailable", error: `The configured Claude Code executable ${this.claudeCommand} does not exist.` };
-    }
-
-    let executable: string | undefined;
-    try {
-      executable = await this.resolveClaude(this.claudeCommand);
-    } catch (error) {
-      return { ok: false, code: "command_failed", error: `Could not resolve the Claude Code executable: ${errorMessage(error)}` };
-    }
-    if (!executable) {
-      return { ok: false, code: "unavailable", error: `The Claude Code CLI (${this.claudeCommand}) was not found on PATH; install it or configure it before starting a claude-code subagent.` };
-    }
+    const resolved = await this.resolveClaudeBin();
+    if (!resolved.ok) return resolved;
+    const { executable } = resolved;
 
     if (!(await isFile(this.runnerModule))) {
       return { ok: false, code: "unavailable", error: `The packaged turn runner was not found at ${this.runnerModule}.` };
@@ -153,6 +152,58 @@ export class ClaudeCodeAdapter implements AgentAdapter {
       },
       metadata: claudeAuthMetadata(this.env),
     };
+  }
+
+  /**
+   * Interactive-mode preflight (issue #15): resolve the `claude` executable only.
+   * No turn runner is involved, so the runner module is not required. It returns
+   * the same bounded, non-secret auth/billing metadata as `preflight`.
+   */
+  async preflightInteractive(_input: SubagentTurnOptions): Promise<AgentPreflightResult> {
+    const resolved = await this.resolveClaudeBin();
+    if (!resolved.ok) return resolved;
+    return {
+      ok: true,
+      env: { [CLAUDE_SUBAGENT_ENV.bin]: resolved.executable },
+      metadata: claudeAuthMetadata(this.env),
+    };
+  }
+
+  /**
+   * Builds the constant interactive TUI command. The executable and (validated)
+   * model are referenced as quoted environment variables; no caller text is ever
+   * interpolated, and no permission-disabling flag is ever added.
+   */
+  async prepareInteractive(input: SubagentTurnOptions, context: AgentInteractiveContext): Promise<AgentInteractiveLaunchSpec> {
+    const optionsError = this.validateOptions(input);
+    if (optionsError) throw new TmuxError(optionsError, "invalid_option");
+
+    const executable = context.preflight[CLAUDE_SUBAGENT_ENV.bin];
+    if (!executable) {
+      throw new TmuxError("The Claude Code executable was not resolved during preflight; refusing to launch.", "invalid_option");
+    }
+    const withModel = input.model !== undefined;
+    return {
+      command: claudeInteractiveCommand(withModel),
+      env: withModel ? { [CLAUDE_INTERACTIVE_ENV.model]: input.model! } : {},
+    };
+  }
+
+  /** Resolves the configured `claude` command without a shell. */
+  private async resolveClaudeBin(): Promise<{ ok: true; executable: string } | { ok: false; code: TmuxError["code"]; error: string }> {
+    if (path.isAbsolute(this.claudeCommand) && !(await isFile(this.claudeCommand))) {
+      return { ok: false, code: "unavailable", error: `The configured Claude Code executable ${this.claudeCommand} does not exist.` };
+    }
+    let executable: string | undefined;
+    try {
+      executable = await this.resolveClaude(this.claudeCommand);
+    } catch (error) {
+      return { ok: false, code: "command_failed", error: `Could not resolve the Claude Code executable: ${errorMessage(error)}` };
+    }
+    if (!executable) {
+      return { ok: false, code: "unavailable", error: `The Claude Code CLI (${this.claudeCommand}) was not found on PATH; install it or configure it before starting a claude-code subagent.` };
+    }
+    return { ok: true, executable };
   }
 
   async prepareTurn(input: SubagentTurnOptions, context: AgentTurnContext): Promise<AgentLaunchSpec> {
@@ -216,6 +267,19 @@ export function claudeTurnArgs(options: { model?: string; resume?: string } = {}
   if (options.model !== undefined) args.push("--model", options.model);
   if (options.resume !== undefined) args.push("--resume", options.resume);
   return args;
+}
+
+/**
+ * The finite, bounded interactive Claude Code TUI argv. It is assembled
+ * internally from validated values; no caller or model text is appended. It
+ * never adds `--dangerously-skip-permissions` (or any other permission-disabling
+ * flag), and the model is only ever referenced as a quoted environment
+ * expansion.
+ */
+export function claudeInteractiveCommand(withModel: boolean): string {
+  const parts = [`exec "$${CLAUDE_SUBAGENT_ENV.bin}"`];
+  if (withModel) parts.push(`--model "$${CLAUDE_INTERACTIVE_ENV.model}"`);
+  return parts.join(" ");
 }
 
 /** Returns an error message when a native resume id is not a safe, bounded argv token. */

@@ -215,6 +215,7 @@ class FakeLedger implements SubagentLedger {
 
 interface FakeAdapterOptions {
   preflight?: { ok: false; code: TmuxError["code"]; error: string };
+  supportsInteractive?: boolean;
 }
 
 function fakeAdapter(options: FakeAdapterOptions = {}): AgentAdapter {
@@ -223,10 +224,19 @@ function fakeAdapter(options: FakeAdapterOptions = {}): AgentAdapter {
     sessionNamePrefix: "fake-subagent",
     provenanceTool: "tmux_subagent_start_claude-code",
     placeholderCommand: "exec sleep 3600",
+    supportsInteractive: options.supportsInteractive ?? true,
     validateOptions: (input) => (input.model === "bad model" ? "model invalid" : undefined),
     lineage: (env) => parseAncestorList(env.FAKE_ANCESTORS),
     async preflight() {
       return options.preflight ?? { ok: true, env: { FAKE_BIN: "/fake/claude", FAKE_REPORTER: "/fake/reporter" } };
+    },
+    async preflightInteractive() {
+      return options.preflight ?? { ok: true, env: { FAKE_BIN: "/fake/claude" } };
+    },
+    async prepareInteractive(input) {
+      const env: Record<string, string> = {};
+      if (input.model !== undefined) env.FAKE_MODEL = input.model;
+      return { command: 'exec "$FAKE_BIN" --tui', env };
     },
     async prepareTurn(input, context) {
       return {
@@ -591,5 +601,152 @@ test("runTurn rejects a concurrent turn and a one-shot ledger", async () => {
     if (!concurrent.ok) assert.equal(concurrent.code, "invalid_option");
   } finally {
     await rm(dir, { recursive: true, force: true });
+  }
+});
+
+// --- Issue #15: interactive TUI mode ----------------------------------------
+
+interface SessionHarness {
+  dir: string;
+  state: FakeState;
+  tmux: FakeTmux;
+  sessions: SubagentSessionRegistry;
+  controller: SubagentController;
+  close: () => Promise<void>;
+}
+
+async function makeSessionHarness(overrides: { adapter?: AgentAdapter; startupProbe?: { attempts: number; intervalMs: number } } = {}): Promise<SessionHarness> {
+  const dir = await mkdtemp(path.join(os.tmpdir(), "subagent-interactive-"));
+  const state = new FakeState();
+  const tmux = new FakeTmux(state);
+  const sessions = new SubagentSessionRegistry(path.join(dir, "sessions.json"));
+  const controller = new SubagentController({
+    tmux,
+    registry: new Registry(path.join(dir, "registry.json")),
+    targets: new FakeTargets(state),
+    adapter: overrides.adapter ?? fakeAdapter(),
+    ledger: new SessionSubagentLedger(sessions, "claude-code"),
+    startupProbe: overrides.startupProbe ?? { attempts: 0, intervalMs: 0 },
+    sleep: async () => undefined,
+  });
+  return { dir, state, tmux, sessions, controller, close: () => rm(dir, { recursive: true, force: true }) };
+}
+
+test("interactive create launches the TUI in the owned pane, stays interactive, and refuses turns", async () => {
+  const h = await makeSessionHarness();
+  try {
+    const created = await h.controller.createInteractiveSession({ agent: "claude-code", cwd: h.dir, task: "", model: "sonnet" }, "parent-a");
+    assert.equal(created.ok, true, created.ok ? "" : created.error);
+    if (!created.ok) return;
+    assert.equal(created.status, "interactive");
+    assert.equal(created.mode, "interactive");
+    assert.equal(created.tmuxSessionId, "$1");
+    assert.equal(created.tmuxPaneId, "%1");
+
+    // The TUI command is constant and carries only quoted env expansions; the
+    // task never appears in it.
+    const command = h.state.commandBySession.get("$1")!;
+    assert.equal(command, 'exec "$FAKE_BIN" --tui');
+    assert.equal(h.state.envBySession.get("$1")?.get("FAKE_MODEL"), "sonnet");
+    const inert = h.state.newSessionArgs[0]!;
+    assert.equal(inert.at(-1), "exec sleep 3600", "the pane starts inert before the TUI launch");
+
+    // Durable state is interactive with the bound pane; no turn exists.
+    const session = await h.sessions.getSession(created.sessionId);
+    assert.equal(session?.status, "interactive");
+    assert.equal(session?.mode, "interactive");
+    assert.equal(session?.tmuxPaneId, "%1");
+    assert.deepEqual(await h.sessions.listTurns({ sessionId: created.sessionId }), []);
+
+    // Running turns on an interactive session is refused.
+    const run = await h.controller.runTurn(created.sessionId, { cwd: h.dir, task: "x" }, "parent-a");
+    assert.equal(run.ok, false);
+    if (!run.ok) assert.equal(run.code, "invalid_option");
+    const cancel = await h.controller.cancelTurn(created.sessionId, "parent-a");
+    assert.equal(cancel.ok, false);
+    if (!cancel.ok) assert.equal(cancel.code, "invalid_option");
+
+    // Status reports interactive and reconciles a vanished TUI pane to lost.
+    const live = await h.controller.statusSession(created.sessionId, "parent-a");
+    assert.equal(live.ok, true);
+    if (!live.ok) return;
+    assert.equal(live.session.status, "interactive");
+    assert.equal(live.session.mode, "interactive");
+    assert.equal(live.session.tmuxPaneId, "%1");
+
+    h.state.removePane("%1");
+    const gone = await h.controller.statusSession(created.sessionId, "parent-a");
+    assert.equal(gone.ok, true);
+    if (gone.ok) {
+      assert.equal(gone.session.status, "lost", "a vanished interactive pane reconciles to lost");
+      assert.equal(gone.reconciled, true);
+    }
+  } finally {
+    await h.close();
+  }
+});
+
+test("interactive close stops the session and tears down only the verified target", async () => {
+  const h = await makeSessionHarness();
+  try {
+    const created = await h.controller.createInteractiveSession({ agent: "claude-code", cwd: h.dir, task: "" }, "parent-a");
+    assert.equal(created.ok, true, created.ok ? "" : created.error);
+    if (!created.ok) return;
+    const closed = await h.controller.closeSession(created.sessionId, "parent-a");
+    assert.equal(closed.ok, true, closed.ok ? "" : closed.error);
+    if (!closed.ok) return;
+    assert.equal(closed.status, "stopped");
+    assert.equal(closed.targetRemoved, true);
+    assert.deepEqual(h.state.killArgs.at(-1), ["kill-session", "-t", "$1"]);
+
+    const repeat = await h.controller.closeSession(created.sessionId, "parent-a");
+    assert.equal(repeat.ok, true);
+    if (repeat.ok) assert.equal(repeat.alreadyClosed, true, "close is idempotent");
+    assert.equal(h.state.killArgs.length, 1);
+  } finally {
+    await h.close();
+  }
+});
+
+test("interactive create rejects an adapter without interactive support and an exited TUI cleans up", async () => {
+  const unsupported = await makeSessionHarness({ adapter: fakeAdapter({ supportsInteractive: false }) });
+  try {
+    const created = await unsupported.controller.createInteractiveSession({ agent: "claude-code", cwd: unsupported.dir, task: "" }, "parent-a");
+    assert.equal(created.ok, false);
+    if (!created.ok) assert.equal(created.code, "invalid_option");
+    assert.deepEqual(unsupported.state.newSessionArgs, [], "nothing is created for an unsupported adapter");
+  } finally {
+    await unsupported.close();
+  }
+
+  const exited = await makeSessionHarness({ startupProbe: { attempts: 1, intervalMs: 0 } });
+  try {
+    exited.state.onRespawn = () => { exited.state.removePane("%1"); };
+    const created = await exited.controller.createInteractiveSession({ agent: "claude-code", cwd: exited.dir, task: "" }, "parent-a");
+    assert.equal(created.ok, false);
+    if (!created.ok) assert.equal(created.code, "command_failed");
+    assert.deepEqual(exited.state.killArgs.at(-1), ["kill-session", "-t", "$1"], "an exited TUI is cleaned up");
+  } finally {
+    await exited.close();
+  }
+});
+
+test("turns remains the default mode and an interactive session never becomes idle", async () => {
+  const h = await makeSessionHarness();
+  try {
+    const created = await h.controller.createSession({ agent: "claude-code", cwd: h.dir, task: "" }, "parent-a");
+    assert.equal(created.ok, true, created.ok ? "" : created.error);
+    if (!created.ok) return;
+    assert.equal(created.mode, "turns");
+    assert.equal(created.status, "idle");
+    assert.equal(created.tmuxPaneId, undefined);
+    assert.equal((await h.sessions.getSession(created.sessionId))?.mode, "turns");
+
+    const interactive = await h.controller.createInteractiveSession({ agent: "claude-code", cwd: h.dir, task: "" }, "parent-a");
+    assert.equal(interactive.ok, true, interactive.ok ? "" : interactive.error);
+    if (!interactive.ok) return;
+    await assert.rejects(h.sessions.transitionSession(interactive.sessionId, "idle", { parentPiSessionId: "parent-a" }), /Illegal transition|never becomes idle/);
+  } finally {
+    await h.close();
   }
 });
