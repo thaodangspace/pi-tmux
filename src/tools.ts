@@ -3,7 +3,14 @@ import type { ExtensionAPI, ExtensionContext, ToolDefinition } from "@earendil-w
 import { Type, type TSchema } from "typebox";
 import { confirmMutation } from "./confirm.ts";
 import { assertSamePlacement, checkOwnership } from "./ownership.ts";
+import {
+  type PiSubagentControllerOptions,
+  type PiSubagentFailure,
+  PiSubagentController,
+  detectParentSession,
+} from "./pi-subagent.ts";
 import { Registry, isTrackedLive, type RegistryEntry, type RegistryKind } from "./registry.ts";
+import { SubagentJobRegistry } from "./subagent-jobs.ts";
 import { Targets, type PaneTarget, type SessionTarget, type WindowTarget } from "./targets.ts";
 import { Tmux, TmuxError, errorMessage } from "./tmux.ts";
 
@@ -13,9 +20,23 @@ const WINDOW = Type.Object({ target: Target });
 const PANE = Type.Object({ target: Target });
 const KEYS = ["Enter", "Escape", "Tab", "BTab", "Space", "Backspace", "Delete", "Up", "Down", "Left", "Right", "Home", "End", "PageUp", "PageDown", "C-c", "C-d", "C-z", "C-\\", "C-a", "C-e", "C-l", "C-r", "C-u", "C-w"] as const;
 const SAFE_NAME = Type.String({ minLength: 1, maxLength: 64, description: "Name (no control characters)." });
+const JOB_ID = Type.String({ minLength: 1, maxLength: 512, description: "Durable subagent job ID returned by tmux_subagent_start_pi." });
+const THINKING_LEVELS = ["off", "minimal", "low", "medium", "high", "xhigh", "max"] as const;
 
-export function registerTmuxTools(pi: ExtensionAPI, tmux = new Tmux(), registry = new Registry()): void {
-  const targets = new Targets(tmux);
+/** Injection points for tests; production callers use the defaults. */
+export interface TmuxToolOptions {
+  /** Reuse a `Targets` (for example over a private tmux socket). */
+  targets?: Targets;
+  /** Reuse a durable subagent job registry. */
+  jobs?: SubagentJobRegistry;
+  /** Override Pi subagent launcher settings (binary, reporter path, probe, clock). */
+  piSubagent?: Partial<Omit<PiSubagentControllerOptions, "tmux" | "registry" | "jobs" | "targets">>;
+}
+
+export function registerTmuxTools(pi: ExtensionAPI, tmux = new Tmux(), registry = new Registry(), options: TmuxToolOptions = {}): void {
+  const targets = options.targets ?? new Targets(tmux);
+  const jobs = options.jobs ?? new SubagentJobRegistry();
+  const piSubagent = new PiSubagentController({ tmux, registry, jobs, targets, ...options.piSubagent });
   const register = <TParams extends TSchema>(definition: ToolDefinition<TParams>) => {
     const execute = definition.execute;
     return pi.registerTool({
@@ -91,7 +112,7 @@ export function registerTmuxTools(pi: ExtensionAPI, tmux = new Tmux(), registry 
   register({ name: "tmux_create_session", label: "Create tmux session", description: "Create a detached tmux session, optionally with a name and working directory. Does not attach or replace Pi's terminal. The new session is recorded in the provenance registry so it can later be identified as created by Pi. Provide parent to record which session it was created from; when omitted, the session Pi itself runs in is detected if possible.", promptSnippet: "Create a detached tmux session", parameters: Type.Object({ name: Type.Optional(SAFE_NAME), cwd: Type.Optional(Type.String({ minLength: 1 })), parent: Type.Optional(Target) }), async execute(_id, p, signal, _update, ctx) {
     validateName(p.name);
     const cwd = p.cwd ? await validateDirectory(p.cwd) : undefined;
-    const parentSessionId = p.parent ? (await targets.session(p.parent, signal)).id : await detectParentSession(tmux, signal);
+    const parentSessionId = p.parent ? (await targets.session(p.parent, signal)).id : await detectParentSession(tmux, process.env, signal);
     const args = ["new-session", "-d", "-P", "-F", "#{session_id}\t#{session_name}", ...(p.name ? ["-s", p.name] : []), ...(cwd ? ["-c", cwd] : [])];
     const [id, autoName] = singleRow(await tmux.run(args, { signal }), 2);
     if (!/^\$\d+$/.test(id!)) throw new TmuxError("tmux created a session but returned an invalid stable ID.");
@@ -172,6 +193,25 @@ export function registerTmuxTools(pi: ExtensionAPI, tmux = new Tmux(), registry 
     const pane = await targets.pane(p.target, signal); await requireSafeSend(pane, signal, ctx);
     await tmux.run(["send-keys", "-t", pane.id, p.key], { signal });
     return result("send named key", { paneId: pane.id, key: p.key });
+  }});
+
+  register({ name: "tmux_subagent_start_pi", label: "Start Pi subagent", description: "Start a delegated Pi subagent in a dedicated detached tmux session owned by this Pi conversation. Creates a durable subagent job, binds stable tmux IDs, launches the packaged Pi child completion reporter, delivers the bounded task without shell interpolation, and returns immediately. Never waits for the child to finish and never passes flags that disable Pi approvals or sandboxing.", promptSnippet: "Start a delegated Pi subagent in a dedicated tmux session", parameters: Type.Object({ cwd: Type.String({ minLength: 1, description: "Absolute, existing working directory for the child Pi." }), task: Type.String({ minLength: 1, maxLength: 20000, description: "Bounded task/prompt delivered verbatim as a single argument; never interpolated into a shell." }), name: Type.Optional(SAFE_NAME), parent: Type.Optional(Target), model: Type.Optional(Type.String({ minLength: 1, maxLength: 128, description: "Optional Pi model selection (safe: selects a model only)." })), thinking: Type.Optional(Type.Union(THINKING_LEVELS.map((level) => Type.Literal(level)))) }), async execute(_id, p, signal, _update, ctx) {
+    const outcome = await piSubagent.start({ cwd: p.cwd, task: p.task, name: p.name, parent: p.parent, model: p.model, thinking: p.thinking }, ctx.sessionManager.getSessionId(), signal);
+    if (!outcome.ok) return failure("start Pi subagent", outcome);
+    const { ok: _ok, ...value } = outcome;
+    return result("start Pi subagent", value);
+  }});
+  register({ name: "tmux_subagent_status", label: "Pi subagent status", description: "Return durable lifecycle state for one subagent job created by this Pi conversation. Never infers completion from pane text. When the tmux server is reachable, a bound non-terminal job whose recorded target no longer exists is reconciled to `lost`.", promptSnippet: "Show durable state of a Pi subagent job", parameters: Type.Object({ jobId: JOB_ID }), async execute(_id, p, signal, _update, ctx) {
+    const outcome = await piSubagent.status(p.jobId, ctx.sessionManager.getSessionId(), signal);
+    if (!outcome.ok) return failure("Pi subagent status", outcome);
+    const { ok: _ok, ...value } = outcome;
+    return result("Pi subagent status", value);
+  }});
+  register({ name: "tmux_subagent_cancel", label: "Cancel Pi subagent", description: "Cancel exactly one known subagent job owned by this Pi conversation. Marks the job `cancelled` and kills only the stable tmux target recorded on that job, never a reused or unrelated target. Idempotent once the job is terminal (including a child that already completed).", promptSnippet: "Cancel a Pi subagent job and its recorded tmux target", parameters: Type.Object({ jobId: JOB_ID }), async execute(_id, p, signal, _update, ctx) {
+    const outcome = await piSubagent.cancel(p.jobId, ctx.sessionManager.getSessionId(), signal);
+    if (!outcome.ok) return failure("cancel Pi subagent", outcome);
+    const { ok: _ok, ...value } = outcome;
+    return result("cancel Pi subagent", value);
   }});
 
   registerKill("tmux_kill_session", "session", "session", (selector, signal) => targets.session(selector, signal), (t) => t.id, (t) => `${t.name} (${t.id})`);
@@ -256,21 +296,7 @@ export function registerTmuxTools(pi: ExtensionAPI, tmux = new Tmux(), registry 
   async function parentOf(sessionId: string, piSessionId: string, signal?: AbortSignal): Promise<string | null> {
     const tracked = await trackedSessions(piSessionId);
     if (tracked.has(sessionId)) return tracked.get(sessionId) ?? null;
-    return detectParentSession(tmux, signal);
-  }
-}
-
-/** The session the calling agent runs inside, when tmux can report it. */
-async function detectParentSession(tmux: Tmux, signal?: AbortSignal): Promise<string | null> {
-  const pane = process.env.TMUX_PANE;
-  if (!pane) return null;
-  try {
-    const serverPid = singleLine(await tmux.run(["display-message", "-p", "#{pid}"], { signal }));
-    if (!process.env.TMUX || process.env.TMUX.split(",")[1] !== serverPid) return null;
-    const id = singleLine(await tmux.run(["display-message", "-p", "-t", pane, "#{session_id}"], { signal }));
-    return /^\$\d+$/.test(id) ? id : null;
-  } catch {
-    return null; // Running outside this server, or the pane is gone: provenance stays unknown.
+    return detectParentSession(tmux, process.env, signal);
   }
 }
 
@@ -313,11 +339,25 @@ export function sanitizeCapture(text: string): string {
     .replace(/[\x00-\x08\x0b-\x1f\x7f]/g, "");
 }
 
+/** Structured `isError` result for a Pi subagent operation that failed. */
+export function failure(operation: string, outcome: PiSubagentFailure) {
+  const details = {
+    operation,
+    ...(outcome.jobId ? { jobId: outcome.jobId } : {}),
+    ...(outcome.status ? { status: outcome.status } : {}),
+    ...(outcome.cleanedUp !== undefined ? { cleanedUp: outcome.cleanedUp } : {}),
+    code: outcome.code,
+    error: outcome.error,
+  };
+  return { content: [{ type: "text" as const, text: `tmux error: ${JSON.stringify(details)}` }], isError: true, details };
+}
+
 export function toolError(error: unknown, operation?: string, params?: unknown) {
   const message = error instanceof TmuxError ? error.message : errorMessage(error);
   const record = params !== null && typeof params === "object" ? params as Record<string, unknown> : {};
   const target = [record.target, record.session, record.window].find((value) => typeof value === "string");
+  const jobId = typeof record.jobId === "string" ? record.jobId : undefined;
   const code = error instanceof TmuxError ? error.code : "command_failed";
-  const details = { ...(operation ? { operation } : {}), ...(target ? { target } : {}), code, error: message };
+  const details = { ...(operation ? { operation } : {}), ...(target ? { target } : {}), ...(jobId ? { jobId } : {}), code, error: message };
   return { content: [{ type: "text" as const, text: `tmux error: ${JSON.stringify(details)}` }], isError: true, details };
 }

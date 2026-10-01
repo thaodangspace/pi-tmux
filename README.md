@@ -20,6 +20,8 @@ Input tools: `tmux_send_text` and `tmux_send_key` send literal text or one restr
 
 Guarded tools: `tmux_kill_session`, `tmux_kill_window`, and `tmux_kill_pane`.
 
+Pi subagent tools: `tmux_subagent_start_pi`, `tmux_subagent_status`, and `tmux_subagent_cancel` are the first-class entrypoint for delegating to a **Pi** child. They create a durable subagent job, own a dedicated detached tmux session, always load the packaged child completion reporter, deliver the task without shell interpolation, and return immediately. The generic `tmux_*` tools remain available and unchanged for every other agent. See [Pi subagent tools](#pi-subagent-tools-parent-side).
+
 Use stable IDs from list/inspect results (`$N` session, `@N` window, `%N` pane) as targets. Exact human-readable selectors are accepted only when unambiguous. Mutations always resolve a target first and use its stable ID; there is no fallback to another target. Names are limited to 64 characters and cannot contain control characters. Working directories must already exist. Resize dimensions are 1–500 cells. Named keys are restricted to Enter, Escape, Tab, BTab, Space, Backspace, Delete, arrows, Home, End, PageUp, PageDown, and the documented `C-*` keys in the tool description.
 
 ## Coding agents in tmux
@@ -42,7 +44,7 @@ Caveats: the registry is local metadata, not cryptographic proof of ownership. S
 
 ## Subagent job registry (`SubagentJobV1`)
 
-A delegated Pi subagent is tracked as a durable job, separate from tmux target provenance, so completion state survives parent/child process restarts. This layer only defines and persists the model — it does not start Pi, detect completion, or notify the parent. The parent-side launcher is still to come; the API is shared by it and the packaged Pi child completion reporter described below.
+A delegated Pi subagent is tracked as a durable job, separate from tmux target provenance, so completion state survives parent/child process restarts. The parent-side launcher is `tmux_subagent_start_pi` (with `tmux_subagent_status`/`tmux_subagent_cancel`); the same API is shared by the packaged Pi child completion reporter described below.
 
 - Registry file: `$XDG_STATE_HOME/pi-tmux/subagent-jobs.json` (default `~/.local/state/pi-tmux/subagent-jobs.json`). Set `PI_TMUX_SUBAGENT_JOBS` to an absolute path to override it. The file is written `0600` inside a `0700` directory, fsynced, and replaced by atomic rename, so a crash never exposes a half-written file and readers never see a partial one.
 - Cross-process read-modify-write is serialized by an owner-only `${file}.lock` next to the state file. Locks are created by hard-linking a fully written temp file, so a crash can never expose an empty lock. A lock is only reclaimed when its recorded PID is confirmed dead (`ESRCH`); a lock held by a live process is never stolen, even when old — waiters fail closed with an actionable error after the timeout (default 10 seconds). Recovery of a dead lock is serialized through a short-lived `${file}.lock.break` file that is itself never stolen, so two contenders can never remove the same lock concurrently. If a process dies while holding the breaker, the registry fails closed and the named files must be removed manually.
@@ -72,7 +74,7 @@ pi --extension <package-root>/extensions/child-reporter.ts --mode json -p "…ta
 | `PI_TMUX_PARENT_SESSION_ID` | conditional | Parent Pi session id. When the job records a parent it must match; when the job records a parent and the variable is absent the metadata is rejected as incomplete. |
 | `PI_TMUX_SUBAGENT_ANCESTORS` | no | Comma-separated job IDs already active in the child's ancestry. The reporter refuses to run when its own job id appears here, then adds its own id so grandchildren inherit the lineage (the recursive-loop guard). |
 
-Launch contract: the parent creates and binds the job, transitions it `created -> starting`, and only then starts the child with the variables above. The child's `TMUX_PANE` is checked against the job's bound `%N` pane when it is present, so a reporter loaded in the wrong pane is rejected rather than misreporting.
+Launch contract: the parent creates and binds the job, transitions it `created -> starting`, and only then starts the child with the variables above. The child's `TMUX_PANE` is checked against the job's bound `%N` pane when it is present, so a reporter loaded in the wrong pane is rejected rather than misreporting. `tmux_subagent_start_pi` performs exactly this contract for Pi; the manual flow is only needed for another agent or a hand-rolled launch.
 
 ### Lifecycle and completion
 
@@ -112,6 +114,64 @@ The summary is truncated from the final assistant message and the error is trunc
 | Child crashes after the durable terminal write, before parent delivery | Still recoverable: `pendingDeliveries()` lists the terminal job until the parent acknowledges it with `markNotified()`. |
 
 The durable job registry is the single source of truth in every case.
+
+## Pi subagent tools (parent side)
+
+For Pi-as-subagent the generic `tmux_create_session` + `tmux_send_text` flow is not enough: it creates no durable job and does not guarantee the completion reporter is loaded. Three additive tools provide a structured entrypoint. The generic `tmux_*` tools are untouched and remain the workflow for Claude Code, Codex, and OpenCode.
+
+- `tmux_subagent_start_pi` takes an absolute existing `cwd`, a bounded `task`, and optional `name`, `parent`, `model`, and `thinking`. It:
+  1. creates a durable `SubagentJobV1` (status `created`);
+  2. resolves the `pi` binary and the packaged child reporter *before* touching tmux, failing the job as `failed` if either is missing;
+  3. creates a dedicated detached tmux session owned by this Pi conversation, records it in the provenance registry, and binds the stable `$N`/`%N` IDs and `serverIdentity` on the job;
+  4. moves the job `created -> starting`, and only then launches the child Pi with the reporter extension via `tmux respawn-pane` on the same stable pane ID;
+  5. performs a short bounded startup liveness probe and returns immediately with `{ jobId, status, tmuxSessionId, tmuxPaneId }`.
+
+  **Startup gate.** The session is first created running an inert `exec sleep 3600` placeholder, and Pi is only started by `respawn-pane` after the durable bind and `starting` transition. A child reporter's `session_start` therefore always observes a bound, `starting`/`running` job and can never race a `created`/unbound one. The `%N` pane ID is unchanged by the respawn, so the reporter's `TMUX_PANE` binding still matches.
+
+  **Startup probe.** After launch, a vanished pane is re-checked against the durable job. A terminal `completed` job is returned as success with `status: "completed"` (a fast child that already settled is not an early-exit failure); any other non-terminal disappearance fails the job and cleans up the session. The tmux `serverIdentity` is required before launch — if it cannot be derived, start fails `unavailable` and cleans up, because a job without a recorded identity could never be safely cancelled.
+- `tmux_subagent_status` returns durable job state only, never pane text. When the tmux server is reachable, a bound non-terminal job whose recorded target has vanished (or whose `serverIdentity` changed) is reconciled to `lost`. A terminal job is returned unchanged.
+- `tmux_subagent_cancel` moves one known job to `cancelled`, then kills the recorded tmux session **only** when it can positively verify the target: the exact recorded pane is present in the exact recorded session, and the current tmux server identity equals the identity recorded on the job. If the pane is missing, belongs to another session, or the server identity is unknown or changed, the job is still cancelled but no tmux target is killed (fail closed), so a reused stable ID can never be destroyed. A terminal job (including a child that already completed) is returned unchanged, so cancellation is idempotent.
+
+Every tool refuses a job whose `parentPiSessionId` is not the calling Pi conversation, and every mutation addresses a stable tmux ID, never a name.
+
+### How the task is delivered safely
+
+The task is never interpolated into a shell command. The tmux session is started with a **constant** command:
+
+```sh
+exec "$PI_TMUX_PI_BIN" --extension "$PI_TMUX_CHILD_REPORTER" --mode json -p -- "$PI_TMUX_SUBAGENT_TASK"
+```
+
+The task, binary, reporter path, job metadata, and optional `--model`/`--thinking` values travel through the tmux session environment (`tmux new-session -e NAME=VALUE`) and are expanded *inside double quotes*, which a shell cannot re-interpret. A task containing `;`, quotes, command substitution, or newlines is delivered byte-for-byte as one argument and is never executed.
+
+Launch environment (in addition to the child reporter contract below):
+
+| Variable | Meaning |
+|---|---|
+| `PI_TMUX_PI_BIN` | Absolute path to the resolved `pi` executable. |
+| `PI_TMUX_CHILD_REPORTER` | Absolute path to the packaged child reporter extension. |
+| `PI_TMUX_SUBAGENT_TASK` | The bounded task, delivered verbatim as one option-terminated argument. |
+| `PI_TMUX_SUBAGENT_MODEL`, `PI_TMUX_SUBAGENT_THINKING` | Optional validated model/thinking selection. |
+
+The tools never pass `--approve`, `--no-approve`, tool allow/deny lists, or any flag that disables approvals or sandboxing; only `--extension`, `--mode json`, `-p`, and the two safe selection flags are used.
+
+### Startup, failure, and cancellation semantics
+
+| Situation | Behavior |
+|---|---|
+| `cwd`/`task`/name/model/thinking invalid | Rejected before any job or session is created. |
+| Pi binary or child reporter missing | The durable job is moved to `failed`; no tmux session is created. |
+| tmux session creation, binding, or `starting` transition fails | The just-created session is killed and the job is moved to `failed`; nothing is leaked. |
+| tmux server identity unavailable before launch | Start fails `unavailable`, kills the just-created session, and moves the job to `failed`; an unkillable job is never launched. |
+| Child exits during startup (bad flag, immediate crash) | The bounded startup probe notices the vanished pane, cleans up, and moves the job to `failed`. |
+| Child finishes and settles before the startup probe | The probe re-reads the durable job and returns success with `status: "completed"`; the already-gone session is not killed or failed. |
+| Child exits after start but before settling | The job stays `running`; `tmux_subagent_status` reconciles it to `lost` against a reachable tmux view. |
+| `cancel` cannot positively verify the recorded target (pane missing, pane in another session, or unknown/changed server identity) | The job is marked `cancelled` but no tmux target is killed (fail closed); a reused stable ID can never be destroyed. |
+| `cancel` on an already-terminal job | Idempotent no-op; the target is not killed. |
+
+### Recursive delegation
+
+The launcher carries this process's own lineage into the child: if the calling Pi is itself a subagent (`PI_TMUX_SUBAGENT_JOB_ID` set), its job ID is appended to `PI_TMUX_SUBAGENT_ANCESTORS`, which the child reporter already refuses to appear in. A chain deeper than the configured bound (default 8) is refused before any job is created.
 
 ## TUI: seeing what Pi created
 
