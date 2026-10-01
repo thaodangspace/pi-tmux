@@ -16,7 +16,8 @@
     ],
     "skills": [
       "./skills/tmux-subagent"
-    ]
+    ],
+    "childReporter": "./extensions/child-reporter.ts"
   },
   "scripts": {
     "build": "tsc --noEmit",

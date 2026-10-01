@@ -59,11 +59,9 @@ export class Tmux {
         failure = reason;
         child.kill("SIGTERM");
         forceTimer = setTimeout(() => child.kill("SIGKILL"), 250);
-        forceTimer.unref?.();
       };
       const onAbort = () => terminate(new TmuxError("tmux operation cancelled.", "cancelled"));
       const timer = setTimeout(() => terminate(new TmuxError(`tmux timed out after ${timeoutMs}ms.`, "timeout")), timeoutMs);
-      timer.unref?.();
       options.signal?.addEventListener("abort", onAbort, { once: true });
 
       const collect = (target: Buffer[]) => (chunk: Buffer | string) => {
