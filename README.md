@@ -111,6 +111,59 @@ adapter, so adding Claude Code or OpenCode does not copy tmux or lifecycle logic
   its `details` now also carry optional `agent`/`sessionId`/`turnId` identity
   (for a one-run job all three equal the `jobId`).
 
+## Generic turn runner for non-Pi agents
+
+Issue #11 adds one packaged, agent-neutral runner that executes exactly one turn
+of a non-Pi CLI agent (Claude Code, OpenCode, …) inside the tmux execution
+boundary the controller already owns:
+
+```text
+tmux server
+  └─ subagent tmux session   (SubagentSessionV1 execution boundary)
+       └─ runner             (src/turn-runner.ts, one process per turn)
+            └─ agent process (spawned with shell:false)
+```
+
+- `src/turn-runner.ts` is the runner. It re-validates the explicit
+  session/turn/pane/tmux-server binding, transitions the turn
+  `starting -> running`, spawns the adapter-provided executable, then derives the
+  outcome only from the child's exit code and its structured JSON/NDJSON output.
+  It writes a small immutable per-attempt payload to
+  `<state-dir>/subagent-reports/` and applies the terminal turn transition
+  atomically. It never inspects pane text, never serializes the scrollback, and
+  leaves the logical session `idle` for the next turn.
+- `src/runner-adapter.ts` (`RunnerAdapter`) is the finite adapter boundary. An
+  agent adapter supplies a validated `RunnerSpecV1`:
+  `{ version, executable, args, env, output: "json"|"ndjson", prompt:
+  "stdin"|"argv", parse? }`. The runner validates the same shape again before it
+  mutates anything, so the adapter can never inject a callback, an arbitrary
+  command string, or model-facing `argv`.
+- The runner environment contract (`PI_TMUX_RUNNER_*`) carries the bounded spec,
+  task, registry path, and session/turn/owner identity. The task is delivered
+  verbatim as one environment value and handed to the child as a single argv
+  element (`prompt: "argv"`) or on stdin (`prompt: "stdin"`); it is never
+  interpolated into a shell command. The runner strips its own `PI_TMUX_*`
+  variables from the child environment so a nested runner cannot inherit another
+  turn's identity.
+- Bounds: stdout/stderr are tail-bounded (256 KiB / 64 KiB), persisted
+  `summary`/`error` are bounded (4 KiB / 2 KiB), and the spec, task, argv, native
+  session id, and environment values all have hard limits.
+- Cancellation and duplicates: a terminal turn is immutable. A parent
+  cancellation that lands first wins, and a losing or duplicate runner discards
+  its own payload and never overwrites the winning `resultPath`.
+- Recovery: if the runner dies before it records a terminal outcome, the durable
+  turn stays non-terminal and `SubagentSessionRegistry.reconcile` marks it `lost`
+  when the recorded pane is gone (or the tmux server identity changed), exactly
+  like the other subagent paths.
+- Parent delivery: `src/turn-completion-delivery.ts`
+  (`TurnCompletionDelivery`) is the session/turn analogue of the job delivery
+  loop. It emits the same `pi-tmux:subagent-completed` event family (with
+  distinct `agent`/`sessionId`/`turnId`), is owner-scoped, observes only while a
+  turn is active or undelivered, and acknowledges delivery durably.
+- The concrete Claude Code / OpenCode flag sets are intentionally **not**
+  hard-coded anywhere: they are deployer-supplied `RunnerSpecV1` data, so a
+  runner never guesses a CLI that may not match the installed version.
+
 ## Pi child completion reporter
 
 For a delegated **Pi** subagent, the child reports its own completion through Pi's `agent_settled` lifecycle event, so the parent never has to scrape pane output or wait for the pane to exit. `agent_end` is not used as the terminal signal because Pi may still continue through retry, compaction, or queued work.

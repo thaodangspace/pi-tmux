@@ -2,6 +2,8 @@ import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { CompletionDelivery, createCompletionSink } from "../src/completion-delivery.ts";
 import { Registry } from "../src/registry.ts";
 import { SubagentJobRegistry } from "../src/subagent-jobs.ts";
+import { SubagentSessionRegistry } from "../src/subagent-sessions.ts";
+import { TurnCompletionDelivery } from "../src/turn-completion-delivery.ts";
 import { Targets } from "../src/targets.ts";
 import { Tmux } from "../src/tmux.ts";
 import { registerTmuxTools } from "../src/tools.ts";
@@ -12,6 +14,7 @@ export default function tmuxControlExtension(pi: ExtensionAPI): void {
   const tmux = new Tmux();
   const registry = new Registry();
   const jobs = new SubagentJobRegistry();
+  const sessions = new SubagentSessionRegistry();
   const targets = new Targets(tmux);
 
   // Parent-side completion delivery for delegated Pi subagents (issue #4). It is
@@ -19,6 +22,10 @@ export default function tmuxControlExtension(pi: ExtensionAPI): void {
   // and it holds a watcher only while this conversation owns an active or
   // undelivered job.
   let delivery: CompletionDelivery | undefined;
+  // Parent-side completion delivery for generic runner turns (issue #11). The
+  // session/turn registry is empty until a non-Pi adapter is used, so this stays
+  // quiescent for Pi-only conversations.
+  let turnDelivery: TurnCompletionDelivery | undefined;
 
   registerTmuxTools(pi, tmux, registry, { jobs, targets });
   registerTmuxUi(pi, { tmux, registry });
@@ -34,14 +41,27 @@ export default function tmuxControlExtension(pi: ExtensionAPI): void {
         if (level === "error") ctx.ui.notify(`pi-tmux: ${message}`, "error");
       },
     });
-    // Recover any terminal job completed while this parent was offline; deferred
+    turnDelivery = new TurnCompletionDelivery({
+      ownerPiSessionId: ctx.sessionManager.getSessionId(),
+      sessions,
+      liveTargets: () => targets.liveTargets(),
+      deliver: createCompletionSink((message, options) => pi.sendMessage(message, options)),
+      log: (level, message) => {
+        if (level === "error") ctx.ui.notify(`pi-tmux: ${message}`, "error");
+      },
+    });
+    // Recover any terminal work completed while this parent was offline; deferred
     // so a delivery that starts a turn does not run inside session startup.
     delivery.notify();
+    turnDelivery.notify();
   });
 
   // A subagent tool may have just created, reconciled, or cancelled a job.
   pi.on("tool_result", (event) => {
-    if (event.toolName.startsWith("tmux_subagent_")) delivery?.notify();
+    if (event.toolName.startsWith("tmux_subagent_")) {
+      delivery?.notify();
+      turnDelivery?.notify();
+    }
   });
 
   pi.on("session_shutdown", async () => {
@@ -50,7 +70,9 @@ export default function tmuxControlExtension(pi: ExtensionAPI): void {
 
   async function detachDelivery(): Promise<void> {
     const current = delivery;
+    const currentTurns = turnDelivery;
     delivery = undefined;
-    await current?.shutdown().catch(() => undefined);
+    turnDelivery = undefined;
+    await Promise.all([current?.shutdown().catch(() => undefined), currentTurns?.shutdown().catch(() => undefined)]);
   }
 }
