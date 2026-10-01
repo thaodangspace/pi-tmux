@@ -73,4 +73,4 @@ pi --extension ./extensions/index.ts --list-models   # exit 0, no stderr (extens
 
 ## PR
 
-URL: (opened from this branch; see the PR comment for the link) · base `main`, head `issue-4-completion-delivery` · references `Fixes #4`. Not merged; issue #4 left open for review.
+URL: https://github.com/thaodangspace/pi-tmux/pull/8 (base `main`, head `issue-4-completion-delivery`). Body references `Fixes #4`; not merged and issue #4 left open for review.
