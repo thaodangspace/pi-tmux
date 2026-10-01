@@ -40,6 +40,19 @@ tmux has no built-in "created from" metadata, so the extension records every ses
 
 Caveats: the registry is local metadata, not cryptographic proof of ownership. Server PID and start time prevent stale entries from being treated as live after a server restart; older entries without an identity are treated as gone. Sessions created outside Pi are invisible to it. The file is bounded to the 2,000 most recent entries.
 
+## Subagent job registry (`SubagentJobV1`)
+
+A delegated Pi subagent is tracked as a durable job, separate from tmux target provenance, so completion state survives parent/child process restarts. This layer only defines and persists the model — it does not start Pi, detect completion, or notify the parent yet, but its API is shared by the parent-side extension and the follow-up Pi child completion reporter.
+
+- Registry file: `$XDG_STATE_HOME/pi-tmux/subagent-jobs.json` (default `~/.local/state/pi-tmux/subagent-jobs.json`). Set `PI_TMUX_SUBAGENT_JOBS` to an absolute path to override it. The file is written `0600` inside a `0700` directory, fsynced, and replaced by atomic rename, so a crash never exposes a half-written file and readers never see a partial one.
+- Cross-process read-modify-write is serialized by an owner-only `${file}.lock` next to the state file. Parent and child processes therefore cannot clobber each other's updates. A lock whose recorded PID is dead, or which is older than 30 seconds, is stolen by atomic rename; lock acquisition times out after 10 seconds with an actionable error.
+- State machine: `created -> starting -> running -> completed | failed | cancelled | lost`. A transition to the current status is an idempotent no-op (including a duplicate terminal transition); any other move out of a terminal status is rejected, so a terminal outcome is immutable. `created -> running` and `starting -> completed` are illegal.
+- A `created` job may have no tmux target yet; it is bound exactly once to stable `$N` session and `%N` pane IDs before it can become `starting`/`running`. Names are never sufficient. Binding rejects a pane already owned by another active job, and `serverIdentity` (`pid:start_time`) is recorded so a live ID on a restarted server is not mistaken for the original target.
+- Every transition is persisted before any completion notification. The first terminal transition assigns a registry-global `completionSeq`; `pendingDeliveries()` lists terminal jobs without `notifiedAt`, oldest first, and `markNotified()` records the parent's acknowledgement. This gives at-least-once delivery that is safe to retry.
+- `reconcile({ live, serverIdentity })` marks non-terminal, bound jobs whose target is missing from the live tmux IDs as `lost`. It should be called with a view taken while the server is reachable.
+- Retention: active jobs and undelivered terminal jobs are never evicted. Acknowledged terminal history is capped at the 100 most recent (configurable); an absolute hard bound of 500 jobs protects the file, and `create` fails with a clear error at the bound rather than silently dropping live data.
+- The API lives in `src/subagent-jobs.ts` as `SubagentJobRegistry`. Corrupt, unexpected, or unknown-version state is reported and never overwritten.
+
 ## TUI: seeing what Pi created
 
 The extension also renders to the interactive UI; none of this calls the model.
