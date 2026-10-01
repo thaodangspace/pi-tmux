@@ -119,4 +119,4 @@ resolution/fail-closed; lineage inheritance; adapter registry dispatch.
 
 ## PR
 
-PR URL: (recorded on merge)
+PR URL: https://github.com/thaodangspace/pi-tmux/pull/17
