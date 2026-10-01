@@ -2,7 +2,7 @@
 
 - Issue: https://github.com/thaodangspace/pi-tmux/issues/14
 - Branch: `issue-14-opencode`
-- PR: _pending_
+- PR: https://github.com/thaodangspace/pi-tmux/pull/21
 - Base: `main` (includes #9/#10/#11/#12/#13; the branch was verified even with `origin/main` before implementing)
 
 ## What was implemented
