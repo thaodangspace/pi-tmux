@@ -54,6 +54,14 @@ export interface SubagentCompletionDetails {
   finishedAt: string;
   resultPath?: string;
   error?: string;
+  /**
+   * Agent/session/turn identity, agent-neutral and additive (issue #10). One-run
+   * job records report the same id for all three; a future session/turn adapter
+   * fills them distinctly so consumers keep one event family.
+   */
+  agent?: string;
+  sessionId?: string;
+  turnId?: string;
 }
 
 export interface SubagentCompletionEvent {
@@ -135,6 +143,10 @@ export function buildSubagentCompletionEvent(job: SubagentJobV1): SubagentComple
     finishedAt: job.finishedAt ?? job.createdAt,
     ...(job.resultPath ? { resultPath: job.resultPath } : {}),
     ...(job.error ? { error: job.error } : {}),
+    // One durable run == one job today, so session/turn identity coincide.
+    agent: "pi",
+    sessionId: job.jobId,
+    turnId: job.jobId,
   };
   return {
     customType: SUBAGENT_COMPLETION_CUSTOM_TYPE,

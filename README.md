@@ -78,6 +78,39 @@ SubagentSession  (agent, cwd, tmux session boundary, native conversation id)
 - The API lives in `src/subagent-sessions.ts` as `SubagentSessionRegistry`.
 - **Migration / compatibility.** The legacy `SubagentJobV1` file is never destroyed or rewritten. `migrateSubagentJobs({ jobsFile?, sessionsFile? })` reads it and atomically imports every job as one session + one turn, preserving status, timestamps, `completionSeq`, and `notifiedAt`, and recording the original `jobId` as the session's `legacyJobId`. Re-running it is idempotent (already-migrated jobs are skipped), a corrupt legacy file fails closed without writing anything, and migrated pending completions remain recoverable through `pendingDeliveries()`. The live Pi tools still use the job registry unchanged, so the existing public contract is preserved.
 
+## Generic subagent controller and agent adapters
+
+Issue #10 splits the Pi launcher into a reusable controller and the first agent
+adapter, so adding Claude Code or OpenCode does not copy tmux or lifecycle logic:
+
+- `src/subagent-controller.ts` (`SubagentController`) owns the agent-independent
+  behavior: the inert startup gate, stable `$N`/`%N` binding, the required tmux
+  `serverIdentity`, parent provenance, `status` reconciliation, fail-closed
+  `cancel`, bounded startup liveness checks, and the recursion-depth guard. It
+  has no knowledge of any agent's executable, arguments, environment, or
+  completion mechanism.
+- `src/agent-adapter.ts` defines `AgentAdapter` (`preflight`, `prepareTurn`,
+  optional `validateOptions`/`lineage`) and `AgentAdapterRegistry`. Adapters
+  return a constant `command` plus environment; the caller task is only ever an
+  environment value expanded inside double quotes, so it is never
+  shell-interpolated.
+- `src/pi-adapter.ts` (`PiAdapter`) is the only Pi-specific code: it resolves the
+  `pi` binary, the packaged child reporter, the Pi CLI arguments, model/thinking
+  validation, the child-reporter environment contract, and the native
+  `agent_settled` completion strategy.
+- `src/subagent-ledgers.ts` adapts the two durable registries to the controller.
+  `JobSubagentLedger` wraps `SubagentJobV1` (the live Pi path, one run per job);
+  `SessionSubagentLedger` wraps the issue #9 session/turn registry and backs the
+  controller's `runTurn`, which executes a successive turn on one logical session
+  while the registry enforces one active turn at a time.
+- `PiSubagentController` (`src/pi-subagent.ts`) is now a thin façade over
+  `SubagentController` + `PiAdapter` + `JobSubagentLedger`, so
+  `tmux_subagent_start_pi` / `tmux_subagent_status` / `tmux_subagent_cancel`,
+  the `SubagentJobV1` records, and the child-reporter contract are unchanged.
+- The parent completion event (`pi-tmux:subagent-completed`) stays one family;
+  its `details` now also carry optional `agent`/`sessionId`/`turnId` identity
+  (for a one-run job all three equal the `jobId`).
+
 ## Pi child completion reporter
 
 For a delegated **Pi** subagent, the child reports its own completion through Pi's `agent_settled` lifecycle event, so the parent never has to scrape pane output or wait for the pane to exit. `agent_end` is not used as the terminal signal because Pi may still continue through retry, compaction, or queued work.
