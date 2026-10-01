@@ -173,6 +173,51 @@ The tools never pass `--approve`, `--no-approve`, tool allow/deny lists, or any 
 
 The launcher carries this process's own lineage into the child: if the calling Pi is itself a subagent (`PI_TMUX_SUBAGENT_JOB_ID` set), its job ID is appended to `PI_TMUX_SUBAGENT_ANCESTORS`, which the child reporter already refuses to appear in. A chain deeper than the configured bound (default 8) is refused before any job is created.
 
+## Parent completion delivery (`pi-tmux:subagent-completed`)
+
+Once a child marks its `SubagentJobV1` terminal, the parent must learn about it without synchronously waiting on tmux. The durable job registry remains the source of truth; the parent extension only *reconciles* and *delivers*.
+
+Detection is bounded and layered:
+
+- While the current Pi conversation owns at least one non-terminal job (or still has an undelivered terminal one), the extension watches the registry directory for writes. The watcher is a hint only: every notification re-reads and validates the durable state, and a touch of the registry file, a lock write, or a duplicate event can never itself be treated as completion.
+- A low-frequency fallback poll (2 s) runs only while observation is active, so a missed watcher event still converges through reconciliation.
+- Observation starts on `session_start` and after any `tmux_subagent_*` tool call, and is released as soon as no job of this conversation is active or undelivered.
+- Non-terminal jobs are reconciled against a live tmux view; a vanished target becomes a terminal `lost` job and is then delivered like any other completion.
+
+Delivery ordering is durable at-least-once with idempotent handling:
+
+```
+child persists terminal job  ->  parent detects/reconciles
+      ->  parent sends the completion message  ->  parent records notifiedAt
+```
+
+The acknowledgement (`notifiedAt`) is written only **after** the delivery attempt. A crash between the two steps leaves the job pending, so it is redelivered on the next pass or on restart. Consumers deduplicate by the stable `jobId` plus registry-global `completionSeq`.
+
+When a terminal job owned by this conversation is found, the extension injects a custom Pi message with `pi.sendMessage` (a system/tool-originated event, not a user message):
+
+```ts
+{
+  customType: "pi-tmux:subagent-completed",
+  content: "Pi subagent <jobId> completed",
+  display: true,
+  details: {
+    version: 1,
+    jobId: string,
+    status: "completed" | "failed" | "cancelled" | "lost",
+    completionSeq: number,
+    finishedAt: string,
+    resultPath?: string,
+    error?: string
+  }
+}
+```
+
+Delivery requests a turn with `{ triggerTurn: true, deliverAs: "followUp" }`, the one shape safe in both parent states: an idle parent is woken into a new turn, and a streaming parent receives the completion as a queued follow-up instead of an interruption. Only the owning `parentPiSessionId` ever receives an event; jobs with no parent, or belonging to another conversation, are skipped. The event carries no child transcript, prompt, or pane capture — only the small bounded job fields.
+
+On `session_start` the parent reconciles and redelivers any terminal job it never acknowledged, so a parent that exited while a child ran, a child that finished while the parent was offline, and a crash immediately after completion are all recovered. `pi-tmux` never runs workflow or GitHub actions; consumers such as `pi-workflow` decide what happens next.
+
+Known limitation: `sendMessage` is fire-and-forget, so delivery is "attempted" rather than confirmed. A crash after a parent has acknowledged but before it consumes a *queued* follow-up message is not redelivered (the durable job is already acknowledged); the guaranteed-and-idempotent path covers completion *detection* and redelivery, not guaranteed model consumption.
+
 ## TUI: seeing what Pi created
 
 The extension also renders to the interactive UI; none of this calls the model.
