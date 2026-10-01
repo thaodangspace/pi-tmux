@@ -16,9 +16,9 @@ All three are additive; the generic `tmux_*` tools are unchanged.
 
 | File | Change |
 |---|---|
-| `src/pi-subagent.ts` | New. `PiSubagentController` (start/status/cancel), safe launch contract, startup gate (inert placeholder + `respawn-pane`), fail-closed cancel verification, PATH resolver, startup probe, provenance, lineage guard. |
+| `src/pi-subagent.ts` | New. `PiSubagentController` (start/status/cancel), safe launch contract, startup gate (inert placeholder + `respawn-pane`), required server identity, completed-aware startup probe, fail-closed cancel verification, PATH resolver, provenance, lineage guard. |
 | `src/tools.ts` | Registered the three subagent tools; `registerTmuxTools` gained an optional injection `options` (jobs/targets/controller settings). Moved `detectParentSession` here-to-there; extended `toolError` with `jobId`. Generic tools untouched. |
-| `test/pi-subagent.test.ts` | New. 20 controller tests (spawn success, deterministic startup-gate readiness, safe task delivery, missing binary/reporter, early exit, bind failure cleanup, status reconcile/unavailable, cancel verified/fail-closed/idempotence, ownership, lineage/depth, invalid input). |
+| `test/pi-subagent.test.ts` | New. 22 controller tests (spawn success, deterministic startup-gate readiness, fast-completed status, required server identity, safe task delivery, missing binary/reporter, early exit, bind failure cleanup, status reconcile/unavailable, cancel verified/fail-closed/idempotence, ownership, lineage/depth, invalid input). |
 | `test/subagent-tools.test.ts` | New. 6 tool-wiring tests: registration, backward-compatible generic tools, structured failures, ownership scoping, terminal idempotence. |
 | `test/pi-subagent-integration.test.ts` | New. 4 tests on an isolated tmux socket with a fake `pi`: byte-for-byte task delivery with shell metacharacters, first-read startup-gate readiness, cancel by stable ID, early-exit cleanup, missing binary. |
 | `test/pi-cli-args.test.ts` | New. 1 test that runs the real `pi` CLI (skipped when absent) and proves `-p -- <task>` treats the task as a message, not an option. |
@@ -43,17 +43,22 @@ All three are additive; the generic `tmux_*` tools are unchanged.
 ```
 npm run typecheck   # TYPECHECK_EXIT=0
 npm test            # TEST_EXIT=0
-# ℹ tests 89  pass 89  fail 0  cancelled 0  skipped 0  (~8s; local machine has pi installed)
+# ℹ tests 91  pass 91  fail 0  cancelled 0  skipped 0  (~8s; local machine has pi installed)
 npm pack --dry-run  # PACK_EXIT=0
 ```
 
-The pre-existing 58 tests still pass unchanged (backward-compatible generic tools); 31 new tests were added. The real-Pi CLI test is skipped where `pi` is not installed (CI), giving 88 pass + 1 skipped there.
+The pre-existing 58 tests still pass unchanged (backward-compatible generic tools); 33 new tests were added. The real-Pi CLI test is skipped where `pi` is not installed (CI), giving 90 pass + 1 skipped there.
 
 ## Parent review fixes (round 2)
 
 1. **Startup race (child could start before bind/`starting`).** The tmux session is now created running an inert `exec sleep 3600` placeholder; the parent binds the job and moves it `created -> starting`, and only then replaces the pane process with the real launch command via `tmux respawn-pane -k` (same stable `%N` pane ID). Pi therefore cannot start until the durable state is ready. Tests: a unit test captures the job status at respawn time and asserts `starting` + bound IDs, plus a real-tmux test where a Node child reads the registry on its first line and records `starting`.
 2. **Cancel could kill reused/unrelated IDs.** Cancel now kills only when it can positively verify the exact recorded pane is present in the exact recorded session *and* the recorded `serverIdentity` equals the current server's. Otherwise the job is marked `cancelled` but the tmux target is left untouched (fail closed). Added mismatch tests: pane in another session, pane missing while the session is live, job without a recorded server identity, changed server identity, and unavailable current server identity.
 3. **Real Pi CLI `-p --`.** Verified against the installed `pi` (0.99.2): `pi --offline --model __pi_tmux_none__/__pi_tmux_none__ -p -- "--help"` exits 1 with a model-not-found error and no help text, while the same command without `--` prints the help usage (exit 0). This proves `-p` is boolean and `--` ends option parsing so the task is a message; it performs no model call. Captured as `test/pi-cli-args.test.ts` (skipped when `pi` is absent).
+
+## Parent review fixes (round 3)
+
+1. **Fast successful child was reported as a start failure.** After the startup probe sees the pane gone, `start` now re-reads the durable job. A terminal `completed` job is returned as success with `status: "completed"` (not `failed`), and its already-gone session is neither killed nor failed. Any other non-terminal disappearance still fails the job and cleans up. Deterministic test: `start reports the actual completed status when a fast child settles before the probe` (the fake registry transitions `starting -> running -> completed` and removes the session at respawn, then asserts `ok: true`, `status: "completed"`, and zero kills).
+2. **`serverIdentity` is now required before launch.** Because cancel can only kill a target it can positively identify, start derives the server identity after creating the session and, if it is unavailable, kills the just-created session and fails the job `unavailable` instead of launching an unkillable job. Test: `start fails (and cleans up) when the tmux server identity is unavailable`.
 
 ## Non-goals (per issue)
 

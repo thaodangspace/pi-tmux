@@ -277,11 +277,21 @@ export class PiSubagentController {
       return { ok: false, code: codeOf(error), error: `Could not create the subagent tmux session: ${errorMessage(error)}`, jobId: job.jobId, status: "failed", cleanedUp: true };
     }
 
+    // Cancel can only kill a target it can positively identify, so the server
+    // identity is required, not best-effort: launching a job without it would
+    // create an unkillable job. The session must exist first, because the
+    // identity is derived from a live session on this server.
     let serverIdentity: string | undefined;
     try {
       serverIdentity = await this.targets.serverIdentity(signal);
     } catch {
-      serverIdentity = undefined; // Provenance/identity is best-effort; the job IDs below are authoritative.
+      serverIdentity = undefined;
+    }
+    if (!serverIdentity) {
+      const cleanedUp = await this.cleanupSession(sessionId, signal);
+      const message = "Could not determine the tmux server identity; refusing to launch a subagent job that cancel could not verify. Check that the tmux server is reachable.";
+      await this.failJob(job.jobId, message);
+      return { ok: false, code: "unavailable", error: message, jobId: job.jobId, status: "failed", cleanedUp };
     }
 
     // Provenance is best-effort: a registry write failure must not hide a session we created.
@@ -289,7 +299,7 @@ export class PiSubagentController {
       await this.recordSession(sessionId, parentSessionId, name, cwd, parentPiSessionId, serverIdentity);
     } catch { /* The durable job below is the authoritative record. */ }
     try {
-      await this.jobs.bind(job.jobId, { tmuxSessionId: sessionId, tmuxPaneId: paneId, ...(serverIdentity ? { serverIdentity } : {}) });
+      await this.jobs.bind(job.jobId, { tmuxSessionId: sessionId, tmuxPaneId: paneId, serverIdentity });
       await this.jobs.transition(job.jobId, "starting");
     } catch (error) {
       const cleanedUp = await this.cleanupSession(sessionId, signal);
@@ -322,11 +332,34 @@ export class PiSubagentController {
       return { ok: false, code: codeOf(error), error: message, jobId: job.jobId, status: "failed", cleanedUp };
     }
 
-    // Bounded startup probe: if the child process dies immediately (bad flag,
-    // crash), the pane vanishes and we fail the job instead of leaving it
-    // "starting" with no live target.
+    // Bounded startup probe: a vanished pane is either an early crash or a child
+    // that already finished and settled. Re-read the durable job to tell them
+    // apart: a terminal `completed` job is a success, not a start failure.
     const alive = await this.probeStartup(paneId, signal);
     if (!alive) {
+      const current = await this.jobs.get(job.jobId).catch(() => undefined);
+      if (current && isTerminalStatus(current.status)) {
+        if (current.status === "completed") {
+          return {
+            ok: true,
+            jobId: job.jobId,
+            status: "completed",
+            tmuxSessionId: sessionId,
+            tmuxPaneId: paneId,
+            name,
+            cwd,
+            parentPiSessionId,
+            serverIdentity,
+          };
+        }
+        return {
+          ok: false,
+          code: current.status === "cancelled" ? "cancelled" : "command_failed",
+          error: `The subagent job reached ${current.status} during startup.`,
+          jobId: job.jobId,
+          status: current.status,
+        };
+      }
       await this.cleanupSession(sessionId, signal);
       const message = "The child Pi process exited during startup; the tmux session was cleaned up.";
       await this.failJob(job.jobId, message);
@@ -342,7 +375,7 @@ export class PiSubagentController {
       name,
       cwd,
       parentPiSessionId,
-      ...(serverIdentity ? { serverIdentity } : {}),
+      serverIdentity,
     };
   }
 

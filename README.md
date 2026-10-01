@@ -127,6 +127,8 @@ For Pi-as-subagent the generic `tmux_create_session` + `tmux_send_text` flow is 
   5. performs a short bounded startup liveness probe and returns immediately with `{ jobId, status, tmuxSessionId, tmuxPaneId }`.
 
   **Startup gate.** The session is first created running an inert `exec sleep 3600` placeholder, and Pi is only started by `respawn-pane` after the durable bind and `starting` transition. A child reporter's `session_start` therefore always observes a bound, `starting`/`running` job and can never race a `created`/unbound one. The `%N` pane ID is unchanged by the respawn, so the reporter's `TMUX_PANE` binding still matches.
+
+  **Startup probe.** After launch, a vanished pane is re-checked against the durable job. A terminal `completed` job is returned as success with `status: "completed"` (a fast child that already settled is not an early-exit failure); any other non-terminal disappearance fails the job and cleans up the session. The tmux `serverIdentity` is required before launch — if it cannot be derived, start fails `unavailable` and cleans up, because a job without a recorded identity could never be safely cancelled.
 - `tmux_subagent_status` returns durable job state only, never pane text. When the tmux server is reachable, a bound non-terminal job whose recorded target has vanished (or whose `serverIdentity` changed) is reconciled to `lost`. A terminal job is returned unchanged.
 - `tmux_subagent_cancel` moves one known job to `cancelled`, then kills the recorded tmux session **only** when it can positively verify the target: the exact recorded pane is present in the exact recorded session, and the current tmux server identity equals the identity recorded on the job. If the pane is missing, belongs to another session, or the server identity is unknown or changed, the job is still cancelled but no tmux target is killed (fail closed), so a reused stable ID can never be destroyed. A terminal job (including a child that already completed) is returned unchanged, so cancellation is idempotent.
 
@@ -160,7 +162,9 @@ The tools never pass `--approve`, `--no-approve`, tool allow/deny lists, or any 
 | `cwd`/`task`/name/model/thinking invalid | Rejected before any job or session is created. |
 | Pi binary or child reporter missing | The durable job is moved to `failed`; no tmux session is created. |
 | tmux session creation, binding, or `starting` transition fails | The just-created session is killed and the job is moved to `failed`; nothing is leaked. |
+| tmux server identity unavailable before launch | Start fails `unavailable`, kills the just-created session, and moves the job to `failed`; an unkillable job is never launched. |
 | Child exits during startup (bad flag, immediate crash) | The bounded startup probe notices the vanished pane, cleans up, and moves the job to `failed`. |
+| Child finishes and settles before the startup probe | The probe re-reads the durable job and returns success with `status: "completed"`; the already-gone session is not killed or failed. |
 | Child exits after start but before settling | The job stays `running`; `tmux_subagent_status` reconciles it to `lost` against a reachable tmux view. |
 | `cancel` cannot positively verify the recorded target (pane missing, pane in another session, or unknown/changed server identity) | The job is marked `cancelled` but no tmux target is killed (fail closed); a reused stable ID can never be destroyed. |
 | `cancel` on an already-terminal job | Idempotent no-op; the target is not killed. |

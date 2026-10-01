@@ -219,6 +219,45 @@ test("Pi cannot start until the job is durably bound and starting", async () => 
   }
 });
 
+test("start reports the actual completed status when a fast child settles before the probe", async () => {
+  const h = await makeHarness({ startupProbe: { attempts: 2, intervalMs: 1 }, sleep: async () => undefined });
+  try {
+    h.state.onRespawn = async (env, paneId) => {
+      const jobId = env.get("PI_TMUX_SUBAGENT_JOB_ID")!;
+      await h.jobs.transition(jobId, "running");
+      await h.jobs.transition(jobId, "completed", { exitCode: 0 });
+      h.state.removeSession(h.state.paneSession.get(paneId)!); // tmux removes the session when Pi exits
+    };
+    const result = await h.controller.start({ cwd: h.dir, task: "fast task" }, "pi-parent");
+    assert.equal(result.ok, true, result.ok ? "" : result.error);
+    if (!result.ok) return;
+    assert.equal(result.status, "completed", "a terminal completed job is a success, not an early-exit failure");
+    assert.equal((await h.jobs.get(result.jobId))?.status, "completed");
+    assert.equal(h.state.killArgs.length, 0, "a completed job's already-gone session is not killed or failed");
+  } finally {
+    await h.close();
+  }
+});
+
+test("start fails (and cleans up) when the tmux server identity is unavailable", async () => {
+  const h = await makeHarness();
+  try {
+    h.state.serverIdentity = undefined; // identity cannot be derived, so cancel could never verify a target
+    const result = await h.controller.start({ cwd: h.dir, task: "task" }, "pi-parent");
+    assert.equal(result.ok, false);
+    if (result.ok) return;
+    assert.equal(result.code, "unavailable");
+    assert.equal(result.status, "failed");
+    assert.equal(h.state.newSessionArgs.length, 1, "the session is created before the identity is derived");
+    assert.equal(h.state.respawnArgs.length, 0, "the child is never launched without a verifiable identity");
+    assert.equal(h.state.killArgs.length, 1, "the just-created session is cleaned up");
+    assert.equal((await h.jobs.get(result.jobId!))?.status, "failed");
+    assert.match(result.error, /server identity/);
+  } finally {
+    await h.close();
+  }
+});
+
 test("the task is delivered verbatim and is never interpreted by the shell", async () => {
   const h = await makeHarness();
   try {
