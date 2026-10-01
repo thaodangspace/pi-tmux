@@ -56,6 +56,13 @@ export interface AgentTurnContext {
   ledgerKind?: "job" | "session";
   /** 1-based index of this turn within the logical session. */
   turnIndex: number;
+  /**
+   * Native conversation id the logical session already recorded (for example a
+   * Claude Code `session_id`), or `undefined` before the first successful turn.
+   * An adapter that resumes a conversation reads it here; it stays out of argv
+   * until the adapter validates it.
+   */
+  agentSessionId?: string;
   /** Comma-free lineage of durable run ids already active above this child. */
   ancestors: string[];
   /** Resolved values from `preflight` (for example a resolved executable path). */
@@ -72,7 +79,15 @@ export interface AgentTurnContext {
  * so the controller can record it on the durable record before any tmux effect.
  */
 export type AgentPreflightResult =
-  | { ok: true; env: Record<string, string> }
+  | {
+      ok: true;
+      env: Record<string, string>;
+      /**
+       * Bounded, non-secret launch metadata a caller may surface (for example an
+       * auth/billing risk flag). Never put credentials or their values here.
+       */
+      metadata?: Readonly<Record<string, string>>;
+    }
   | { ok: false; code: TmuxError["code"]; error: string };
 
 /** How the parent learns that a turn reached a terminal outcome. */

@@ -140,9 +140,18 @@ export class RunnerAdapter implements AgentAdapter {
    * constants that are shell-quoted. No caller-provided text appears here.
    */
   runnerCommand(): string {
-    const parts = ["exec", `"$${RUNNER_ENV.bin}"`, ...this.runnerArgs.map(shellQuote), `"$${RUNNER_ENV.module}"`];
-    return parts.join(" ");
+    return runnerLaunchCommand(this.runnerArgs);
   }
+}
+
+/**
+ * The constant command tmux runs for any runner-backed adapter. The executable
+ * and module are quoted environment expansions; the runner's fixed Node flags
+ * are trusted constants that are shell-quoted. No caller-provided text appears.
+ */
+export function runnerLaunchCommand(runnerArgs: readonly string[]): string {
+  const parts = ["exec", `"$${RUNNER_ENV.bin}"`, ...runnerArgs.map(shellQuote), `"$${RUNNER_ENV.module}"`];
+  return parts.join(" ");
 }
 
 /** Single-quotes one trusted constant so it survives the shell tmux runs. */
