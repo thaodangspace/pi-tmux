@@ -24,8 +24,13 @@ export async function checkOwnership(targets: Targets, registry: Registry, kind:
     return { exclusive: false, fingerprint, reason: "target is linked or grouped with another session" };
   }
   const identity = await targets.serverIdentity(signal);
-  const owned = !!identity && (await registry.list()).some((entry) => entry.kind === "session" && entry.id === sessions[0] && entry.piSessionId === piSessionId && entry.serverIdentity === identity);
-  return { exclusive: owned, fingerprint, reason: owned ? "" : "session is not owned by this Pi conversation" };
+  const entries = identity ? (await registry.list()).filter((entry) => entry.piSessionId === piSessionId && entry.serverIdentity === identity) : [];
+  const sessionOwned = entries.some((entry) => entry.kind === "session" && entry.id === sessions[0]);
+  const windowId = matches[0]![1]!;
+  const windowOwned = kind !== "session" && entries.some((entry) => entry.kind === "window" && entry.id === windowId && entry.sessionId === sessions[0]);
+  const paneOwned = kind === "pane" && entries.some((entry) => entry.kind === "pane" && entry.id === id && entry.sessionId === sessions[0] && entry.windowId === windowId);
+  const owned = sessionOwned || windowOwned || paneOwned;
+  return { exclusive: owned, fingerprint, reason: owned ? "" : "target is not owned by this Pi conversation" };
 }
 
 export function assertSamePlacement(before: Ownership, after: Ownership): void {

@@ -27,11 +27,12 @@ export function registerTmuxTools(pi: ExtensionAPI, tmux = new Tmux(), registry 
     });
   };
 
-  register({ name: "tmux_list_sessions", label: "tmux sessions", description: "List sessions on the default tmux server, including existing sessions. Returns stable IDs. Each session reports whether it was created by this extension (tracked) and, when known, the session the creating agent ran in (parentSessionId).", promptSnippet: "List tmux sessions", parameters: Type.Object({ tracked: Type.Optional(Type.Boolean({ description: "Only sessions created by this extension (true) or only sessions not created by it (false)." })) }), async execute(_id, p, signal, _update, ctx) {
+  register({ name: "tmux_list_sessions", label: "tmux sessions", description: "List sessions on the default tmux server, including existing sessions. Returns stable IDs. Each session reports whether it was created by this extension (tracked), when known the session the creating agent ran in (parentSessionId), and whether it is the session Pi itself runs in (current). `current` is detected from TMUX_PANE and is the session to create subagent windows in; an attached client's session is not necessarily Pi's own.", promptSnippet: "List tmux sessions", parameters: Type.Object({ tracked: Type.Optional(Type.Boolean({ description: "Only sessions created by this extension (true) or only sessions not created by it (false)." })) }), async execute(_id, p, signal, _update, ctx) {
     const sessions = await targets.sessions(signal);
     const tracked = await trackedSessions(ctx.sessionManager.getSessionId());
+    const currentSessionId = await detectParentSession(tmux, signal);
     const items = sessions
-      .map((session) => ({ ...session, tracked: tracked.has(session.id), parentSessionId: tracked.get(session.id) ?? null }))
+      .map((session) => ({ ...session, tracked: tracked.has(session.id), parentSessionId: tracked.get(session.id) ?? null, current: session.id === currentSessionId }))
       .filter((session) => p.tracked === undefined || session.tracked === p.tracked);
     return result("list sessions", { items, registryFile: registry.file });
   }});
@@ -99,16 +100,17 @@ export function registerTmuxTools(pi: ExtensionAPI, tmux = new Tmux(), registry 
     const record = await remember({ kind: "session", id: id!, sessionId: id!, parentSessionId, piSessionId: ctx.sessionManager.getSessionId(), name, cwd, tool: "tmux_create_session" });
     return result("create detached session", { id, name, attached: false, parentSessionId, ...record });
   }});
-  register({ name: "tmux_create_window", label: "Create tmux window", description: "Create a detached window in an explicit session; does not switch the current window. The window is recorded in the provenance registry.", promptSnippet: "Create a detached tmux window", parameters: Type.Object({ session: Target, name: Type.Optional(SAFE_NAME), cwd: Type.Optional(Type.String({ minLength: 1 })) }), async execute(_id, p, signal, _update, ctx) {
+  register({ name: "tmux_create_window", label: "Create tmux window", description: "Create a detached window, by default in the tmux session Pi itself is running in (detected from TMUX_PANE); pass session to target another session explicitly. Does not switch the current window. The window is recorded in the provenance registry.", promptSnippet: "Create a detached tmux window (defaults to Pi's own session)", parameters: Type.Object({ session: Type.Optional(Target), name: Type.Optional(SAFE_NAME), cwd: Type.Optional(Type.String({ minLength: 1 })) }), async execute(_id, p, signal, _update, ctx) {
     validateName(p.name);
     const cwd = p.cwd ? await validateDirectory(p.cwd) : undefined;
-    const session = await targets.session(p.session, signal);
+    const sessionId = p.session ? (await targets.session(p.session, signal)).id : await requireOwnSession(tmux, signal);
+    const session = await targets.session(sessionId, signal);
     await targets.session(session.id, signal);
     const output = await tmux.run(["new-window", "-d", "-P", "-F", "#{window_id}\t#{window_name}", "-t", session.id, ...(p.name ? ["-n", p.name] : []), ...(cwd ? ["-c", cwd] : [])], { signal });
     const [id, autoName] = singleRow(output, 2);
     if (!/^@\d+$/.test(id!)) throw new TmuxError("tmux created a window but returned an invalid stable ID.");
     const name = autoName ?? p.name ?? id!;
-    const parentSessionId = await parentOf(session.id, ctx.sessionManager.getSessionId(), signal);
+    const parentSessionId = p.session ? await parentOf(session.id, ctx.sessionManager.getSessionId(), signal) : session.id;
     const record = await remember({ kind: "window", id: id!, sessionId: session.id, windowId: id!, parentSessionId, piSessionId: ctx.sessionManager.getSessionId(), name, cwd, tool: "tmux_create_window" });
     return result("create detached window", { id, sessionId: session.id, name, selected: false, parentSessionId, ...record });
   }});
@@ -161,14 +163,14 @@ export function registerTmuxTools(pi: ExtensionAPI, tmux = new Tmux(), registry 
     return result("resize pane", { id: pane.id, dimension: p.dimension, amount: p.amount });
   }});
 
-  register({ name: "tmux_send_text", label: "Send text to tmux pane", description: "Send literal text to an explicitly targeted pane. Panes outside sessions created by this extension require confirmation; text can execute commands.", promptSnippet: "Send literal text to a tmux pane", parameters: Type.Object({ target: Target, text: Type.String({ minLength: 1, maxLength: 10000 }) }), async execute(_id, p, signal, _update, ctx) {
+  register({ name: "tmux_send_text", label: "Send text to tmux pane", description: "Send literal text to an explicitly targeted pane. Panes not owned by this Pi conversation (via their session, window, or pane) require confirmation; text can execute commands.", promptSnippet: "Send literal text to a tmux pane", parameters: Type.Object({ target: Target, text: Type.String({ minLength: 1, maxLength: 10000 }) }), async execute(_id, p, signal, _update, ctx) {
     if (p.text.includes("\0")) throw new TmuxError("Text cannot contain NUL bytes.", "invalid_option");
     const pane = await targets.pane(p.target, signal);
     await requireSafeSend(pane, signal, ctx);
     await tmux.run(["send-keys", "-l", "-t", pane.id, "--", p.text], { signal });
     return result("send literal text (no Enter appended)", { paneId: pane.id, bytes: Buffer.byteLength(p.text), enterAppended: false });
   }});
-  register({ name: "tmux_send_key", label: "Send named key to tmux pane", description: `Send one restricted named key to an explicitly targeted pane. Panes outside sessions created by this extension require confirmation. Supported: ${KEYS.join(", ")}.`, promptSnippet: "Send a named key to a tmux pane", parameters: Type.Object({ target: Target, key: Type.Union(KEYS.map((key) => Type.Literal(key))) }), async execute(_id, p, signal, _update, ctx) {
+  register({ name: "tmux_send_key", label: "Send named key to tmux pane", description: `Send one restricted named key to an explicitly targeted pane. Panes not owned by this Pi conversation (via their session, window, or pane) require confirmation. Supported: ${KEYS.join(", ")}.`, promptSnippet: "Send a named key to a tmux pane", parameters: Type.Object({ target: Target, key: Type.Union(KEYS.map((key) => Type.Literal(key))) }), async execute(_id, p, signal, _update, ctx) {
     const pane = await targets.pane(p.target, signal); await requireSafeSend(pane, signal, ctx);
     await tmux.run(["send-keys", "-t", pane.id, p.key], { signal });
     return result("send named key", { paneId: pane.id, key: p.key });
@@ -183,7 +185,7 @@ export function registerTmuxTools(pi: ExtensionAPI, tmux = new Tmux(), registry 
     resolveTarget: (selector: string, signal?: AbortSignal) => Promise<T>,
     idOf: (target: T) => string, describe: (target: T) => string,
   ) {
-    register({ name, label: `Kill tmux ${noun}`, description: `Permanently kill an explicitly targeted ${noun}. Sessions created by this extension require no confirmation; other targets require confirmation. Revalidates the stable ID before mutation.`, promptSnippet: `Kill a tmux ${noun}`, parameters: Type.Object({ target: Target }), async execute(_id, p, signal, _update, ctx) {
+    register({ name, label: `Kill tmux ${noun}`, description: `Permanently kill an explicitly targeted ${noun}. Targets owned by this Pi conversation (via their session, window, or pane) require no confirmation; other targets require confirmation. Revalidates the stable ID before mutation.`, promptSnippet: `Kill a tmux ${noun}`, parameters: Type.Object({ target: Target }), async execute(_id, p, signal, _update, ctx) {
       const target = await resolveTarget(p.target, signal); const stableId = idOf(target);
       let action = `kill ${noun}`;
       if (kind === "pane" && "windowId" in target) {
@@ -245,7 +247,7 @@ export function registerTmuxTools(pi: ExtensionAPI, tmux = new Tmux(), registry 
 
   async function requireSafeSend(pane: PaneTarget, signal: AbortSignal | undefined, ctx: ExtensionContext): Promise<void> {
     const before = await checkOwnership(targets, registry, "pane", pane.id, ctx.sessionManager.getSessionId(), signal);
-    if (!before.exclusive) await confirmMutation(ctx, "send input to a pane outside an exclusively Pi-owned session", `${describePane(pane)} (${before.reason})`, signal);
+    if (!before.exclusive) await confirmMutation(ctx, "send input to a pane not owned by this Pi conversation", `${describePane(pane)} (${before.reason})`, signal);
     await targets.pane(pane.id, signal);
     const after = await checkOwnership(targets, registry, "pane", pane.id, ctx.sessionManager.getSessionId(), signal);
     assertSamePlacement(before, after);
@@ -258,6 +260,13 @@ export function registerTmuxTools(pi: ExtensionAPI, tmux = new Tmux(), registry 
     if (tracked.has(sessionId)) return tracked.get(sessionId) ?? null;
     return detectParentSession(tmux, signal);
   }
+}
+
+/** The session Pi itself runs in, or a clear error when Pi is outside tmux. */
+async function requireOwnSession(tmux: Tmux, signal?: AbortSignal): Promise<string> {
+  const id = await detectParentSession(tmux, signal);
+  if (!id) throw new TmuxError("Cannot determine the session Pi is running in because Pi is not inside tmux (TMUX_PANE is unset). Pass an explicit session target from tmux_list_sessions; do not assume the session an attached client is viewing is Pi's own.", "invalid_target");
+  return id;
 }
 
 /** The session the calling agent runs inside, when tmux can report it. */

@@ -61,6 +61,26 @@ test("isolated tmux server exercises tools without touching the user's default s
     assert.equal((await call("tmux_inspect_session", { target: created.id })).id, created.id);
     assert.match(await callError("tmux_select_session", { target: created.id }), /No attached tmux client/);
 
+    // tmux_create_window must default to the session Pi runs in, never the client's view.
+    const ownPane = (await call("tmux_list_panes", { session: created.id })).items[0].id;
+    const serverPid = (await tmux.run(["display-message", "-p", "#{pid}"])).trim();
+    const savedTmux = process.env.TMUX;
+    const savedPane = process.env.TMUX_PANE;
+    process.env.TMUX = `${socket},${serverPid},0`;
+    process.env.TMUX_PANE = ownPane;
+    try {
+      const ownSession = (await call("tmux_list_sessions")).items.find((item: any) => item.current);
+      assert.equal(ownSession.id, created.id, "the running session is flagged current");
+      const defaultWindow = await call("tmux_create_window", { name: "auto-own" });
+      assert.equal(defaultWindow.sessionId, created.id, "window defaults to the session Pi runs in");
+      assert.equal(defaultWindow.parentSessionId, created.id);
+      await call("tmux_kill_window", { target: defaultWindow.id });
+    } finally {
+      if (savedTmux === undefined) delete process.env.TMUX; else process.env.TMUX = savedTmux;
+      if (savedPane === undefined) delete process.env.TMUX_PANE; else process.env.TMUX_PANE = savedPane;
+    }
+    assert.match(await callError("tmux_create_window", { name: "no-parent" }), /not inside tmux|TMUX_PANE/);
+
     const window = await call("tmux_create_window", { session: created.id, name: "extra", cwd: directory });
     assert.match(window.id, /^@\d+$/);
     assert.equal(window.selected, false);
@@ -79,6 +99,15 @@ test("isolated tmux server exercises tools without touching the user's default s
     await runTmux(socket, ["new-session", "-d", "-s", "external"]);
     const externalPane = (await call("tmux_list_panes", { session: "external" })).items[0].id;
     assert.match(await callError("tmux_send_key", { target: externalPane, key: "Enter" }, headless), /confirmation|UI/i);
+    const ownedWindow = await call("tmux_create_window", { session: "external", name: "owned" });
+    const ownedWindowPane = (await call("tmux_list_panes", { window: ownedWindow.id })).items[0].id;
+    await call("tmux_send_key", { target: ownedWindowPane, key: "Enter" }, headless);
+    const ownedPane = await call("tmux_split_pane", { target: externalPane, orientation: "vertical" });
+    await call("tmux_send_key", { target: ownedPane.id, key: "Enter" }, headless);
+    assert.match(await callError("tmux_send_key", { target: externalPane, key: "Enter" }, headless), /confirmation|UI/i);
+    assert.match(await callError("tmux_kill_window", { target: (await call("tmux_list_windows", { session: "external" })).items.find((item: any) => item.id !== ownedWindow.id).id }, headless), /confirmation|UI/i);
+    await call("tmux_kill_pane", { target: ownedPane.id }, headless);
+    await call("tmux_kill_window", { target: ownedWindow.id }, headless);
     assert.match(await callError("tmux_kill_session", { target: "external" }, headless), /confirmation|UI/i);
     await runTmux(socket, ["link-window", "-s", window.id, "-t", "external:"]);
     assert.match(await callError("tmux_send_key", { target: pane, key: "Enter" }, headless), /confirmation|UI/i);
