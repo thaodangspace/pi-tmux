@@ -174,4 +174,4 @@ Covered by the new tests:
 
 ## PR
 
-PR URL: https://github.com/thaodangspace/pi-tmux/pull/__PR_NUMBER__
+PR URL: https://github.com/thaodangspace/pi-tmux/pull/18
