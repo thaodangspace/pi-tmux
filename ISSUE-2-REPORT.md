@@ -95,4 +95,6 @@ The 16 reporter tests cover: env parsing, `starting -> running` + completion pay
 
 ## PR
 
-URL: https://github.com/thaodangspace/pi-tmux/pull/6 (base `main`, head `issue-2-child-reporter`; not merged; issue #2 left open). CI status tracked after the correction push.
+URL: https://github.com/thaodangspace/pi-tmux/pull/6 (base `main`, head `issue-2-child-reporter`; not merged; issue #2 left open).
+
+CI on the correction commit `a021595` is **green**: run [36805723859](https://github.com/thaodangspace/pi-tmux/actions/runs/36805723859) (`test` pass, 36s) and the push run `36805719997` (`test` pass, 28s). Baseline `main` remains red for the pre-existing reason documented above; a doc-only follow-up commit re-runs CI on this branch.
