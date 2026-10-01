@@ -43,7 +43,7 @@ child persists terminal job  ->  parent detects/reconciles
 
 ```
 npm run typecheck   # exit 0
-npm test            # exit 0  (104 tests: 91 pre-existing + 13 new, 0 fail, 0 skipped on this machine)
+npm test            # exit 0  (108 tests: 91 pre-existing + 17 new, 0 fail, 0 skipped on this machine)
 npm pack --dry-run  # exit 0
 pi --extension ./extensions/index.ts --list-models   # exit 0, no stderr (extension smoke-loads)
 ```
@@ -70,6 +70,28 @@ pi --extension ./extensions/index.ts --list-models   # exit 0, no stderr (extens
 2. **No Pi runtime integration in CI.** Idle/busy behavior is asserted against an emulation of Pi's documented `sendCustomMessage` dispatch plus the option shape; a live Pi session is not exercised in tests. This mirrors the existing repo's testing approach.
 3. **Reconciliation cadence.** While active, each signal reconciles against a live tmux view. This is one extra tmux read per parent-side signal; it is bounded to active observation and is released when idle.
 4. **Non-goals honored.** No synchronous wait, no workflow/DAG, no automatic GitHub/PR actions, no Claude/Codex/OpenCode support.
+
+## Review fix (round 1)
+
+A reviewer found two blocking defects in the first revision:
+
+1. **Perpetual self-trigger while a job is active.** `CompletionDelivery.pass()` called `jobs.reconcile(view)` on every watcher/poll signal, and `SubagentJobRegistry.reconcile` always ran the full read-modify-**write**, so every no-op reconcile renamed the registry file, which the parent's own watcher observed, which triggered another reconcile — an unbounded loop of writes and live tmux reads for as long as any job was active.
+2. **Global reconcile touched other parents' jobs.** `reconcile` iterated *all* jobs, so one parent's observer could mark another conversation's vanished jobs `lost` and produce delivery bookkeeping for them.
+
+Fixes:
+
+- `SubagentJobRegistry.reconcile(view, { parentPiSessionId? })` now accepts an optional owner scope; only that parent's non-terminal jobs are considered.
+- The registry's write path is now change-aware: `mutateIfChanged` skips the atomic write (and thus the filesystem event) when a change reports that it altered nothing. `reconcile` returns `changed: changed.length > 0`, so a quiescent reconcile is a true no-op with no rename. Every mutating operation (`create`, `bind`, `transition`, `markNotified`) still always writes.
+- `CompletionDelivery.pass()` reconciles with `{ parentPiSessionId: this.owner }`.
+
+Regression tests added:
+
+| Test | File | Asserts |
+|---|---|---|
+| `a no-op reconcile does not rewrite the registry file` | `test/subagent-jobs.test.ts` | inode and mtime are unchanged after a nothing-to-do reconcile (no rename). |
+| `reconcile can be scoped to one parent and never mutates another parent's job` | `test/subagent-jobs.test.ts` | the scoped owner's job becomes `lost`; another parent's job stays `running`; empty scope is rejected. |
+| `delivery never reconciles or acknowledges another parent's job` | `test/completion-delivery.test.ts` | with both targets missing, only this parent's job is delivered/acked; the other stays `running` and unacknowledged. |
+| `a live job keeps observation quiescent without self-triggering registry writes` | `test/completion-delivery.test.ts` | with a real watcher and a live job, a burst of signals leaves the registry file's inode/mtime unchanged and delivers nothing. |
 
 ## PR
 

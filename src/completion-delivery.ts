@@ -266,7 +266,9 @@ export class CompletionDelivery {
       if (active && this.liveTargets) {
         try {
           const view = await this.liveTargets();
-          await this.jobs.reconcile(view);
+          // Scope to this parent: another conversation's jobs are never reconciled
+          // here, and a no-op reconcile does not rewrite the file.
+          await this.jobs.reconcile(view, { parentPiSessionId: this.owner });
         } catch (error) {
           this.log("warning", `Could not reconcile Pi subagent jobs against tmux: ${errorMessage(error)}`);
         }

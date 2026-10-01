@@ -314,21 +314,32 @@ export class SubagentJobRegistry {
   }
 
   /**
-   * Marks every non-terminal, already-bound job whose stable tmux target is
-   * missing from `view.live` as `lost` (a terminal outcome). A job bound to a
-   * different `serverIdentity` than the live view is also lost, because a live
-   * ID on a restarted server is a different target. Callers should only
-   * reconcile against a view taken while the server is reachable.
+   * Marks non-terminal, already-bound jobs whose stable tmux target is missing
+   * from `view.live` as `lost` (a terminal outcome). A job bound to a different
+   * `serverIdentity` than the live view is also lost, because a live ID on a
+   * restarted server is a different target. Callers should only reconcile
+   * against a view taken while the server is reachable.
+   *
+   * `options.parentPiSessionId` scopes reconciliation to one parent's jobs, so a
+   * parent-side observer can never rewrite another conversation's jobs. When
+   * nothing changes, the registry file is not rewritten: a no-op reconcile must
+   * not emit a filesystem event, which is what lets a watcher-driven parent stay
+   * quiescent while its job is live.
    */
-  async reconcile(view: SubagentJobLiveView): Promise<SubagentJobV1[]> {
+  async reconcile(view: SubagentJobLiveView, options: { parentPiSessionId?: string } = {}): Promise<SubagentJobV1[]> {
     if (view === null || typeof view !== "object" || !(view.live instanceof Set)) {
       throw new TmuxError("reconcile requires a live view with a Set of tmux IDs.", "invalid_option");
     }
+    const owner = options.parentPiSessionId;
+    if (owner !== undefined && (typeof owner !== "string" || !owner)) {
+      throw new TmuxError("reconcile parentPiSessionId must be a non-empty string when provided.", "invalid_option");
+    }
     const at = this.now().toISOString();
-    return this.mutate((state) => {
+    return this.mutateIfChanged((state) => {
       const changed: SubagentJobV1[] = [];
       for (const job of state.jobs) {
         if (isTerminalStatus(job.status)) continue;
+        if (owner !== undefined && job.parentPiSessionId !== owner) continue; // Never another parent's job.
         const targetId = job.tmuxPaneId ?? job.tmuxSessionId;
         if (targetId === null) continue; // Never bound; it cannot have been lost on the server.
         const identityLost = view.serverIdentity !== undefined
@@ -340,7 +351,7 @@ export class SubagentJobRegistry {
         if (job.completionSeq === undefined) job.completionSeq = state.nextCompletionSeq++;
         changed.push({ ...job });
       }
-      return changed;
+      return { value: changed, changed: changed.length > 0 };
     });
   }
 
@@ -408,15 +419,27 @@ export class SubagentJobRegistry {
   }
 
   private async mutate<T>(change: (state: SubagentJobState) => T): Promise<T> {
+    return this.mutateIfChanged((state) => ({ value: change(state), changed: true }));
+  }
+
+  /**
+   * Like `mutate`, but the change reports whether it actually altered state.
+   * When it did not (and nothing was pruned), the registry file is left
+   * untouched: a no-op reconcile must not rename the file, because a parent
+   * watching that file would otherwise wake itself in a loop.
+   */
+  private async mutateIfChanged<T>(change: (state: SubagentJobState) => { value: T; changed: boolean }): Promise<T> {
     const run = async (): Promise<T> => {
       await this.acquireLock();
       try {
         const state = await this.readState();
-        pruneAcknowledged(state, this.maxAcknowledged);
-        const result = change(state);
-        pruneAcknowledged(state, this.maxAcknowledged);
-        await this.writeState(state);
-        return result;
+        const pruned = pruneAcknowledged(state, this.maxAcknowledged);
+        const { value, changed } = change(state);
+        if (changed || pruned > 0) {
+          pruneAcknowledged(state, this.maxAcknowledged);
+          await this.writeState(state);
+        }
+        return value;
       } finally {
         await this.releaseLock();
       }

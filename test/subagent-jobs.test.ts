@@ -264,6 +264,34 @@ test("reconcile marks missing or foreign targets lost and leaves terminal jobs a
   });
 });
 
+test("a no-op reconcile does not rewrite the registry file", async () => {
+  await withRegistry(async (registry, file) => {
+    await jobAt(registry, "running", { session: "$1", pane: "%1", serverIdentity: "1:1" });
+    const before = await stat(file);
+    assert.deepEqual(await registry.reconcile({ live: new Set(["$1", "%1"]), serverIdentity: "1:1" }), []);
+    const after = await stat(file);
+    // Every write replaces the file by atomic rename, so a changed inode is a
+    // write; a no-op reconcile must leave the file (and any watcher) alone.
+    assert.equal(after.ino, before.ino, "a no-op reconcile must not rename the registry file");
+    assert.equal(after.mtimeMs, before.mtimeMs, "a no-op reconcile must not write the registry file");
+  });
+});
+
+test("reconcile can be scoped to one parent and never mutates another parent's job", async () => {
+  await withRegistry(async (registry) => {
+    const mine = await jobAt(registry, "running", { session: "$1", pane: "%1", serverIdentity: "1:1", parent: "pi-a" });
+    const theirs = await jobAt(registry, "running", { session: "$2", pane: "%2", serverIdentity: "1:1", parent: "pi-b" });
+
+    const lost = await registry.reconcile({ live: new Set<string>(), serverIdentity: "1:1" }, { parentPiSessionId: "pi-a" });
+    assert.deepEqual(lost.map((job) => job.jobId), [mine]);
+    assert.equal((await registry.get(mine))!.status, "lost");
+    assert.equal((await registry.get(theirs))!.status, "running", "another parent's job is never reconciled");
+    assert.equal((await registry.get(theirs))!.finishedAt, undefined);
+
+    await assert.rejects(() => registry.reconcile({ live: new Set<string>() }, { parentPiSessionId: "" }), /non-empty string/);
+  });
+});
+
 test("two registry instances sharing a file serialize read-modify-write", async () => {
   await withRegistry(async (registry, file) => {
     const a = new SubagentJobRegistry(file, { lockRetryMs: 1 });

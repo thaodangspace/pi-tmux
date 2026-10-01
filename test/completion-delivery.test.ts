@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { randomUUID } from "node:crypto";
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdtemp, rm, stat } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
@@ -266,6 +266,59 @@ test("reconciles a vanished running job to lost and delivers the lost completion
     assert.equal(delivered[0]!.details.status, "lost");
     assert.equal((await h.jobs.get(job.jobId))?.status, "lost", "the durable registry is the source of truth for the terminal state");
     assert.equal((await h.jobs.get(job.jobId))?.notifiedAt !== undefined, true);
+    await delivery.shutdown();
+  } finally {
+    await h.close();
+  }
+});
+
+test("delivery never reconciles or acknowledges another parent's job", async () => {
+  const h = await makeHarness();
+  try {
+    const mine = await h.createRunningJob("ses-parent");
+    const theirs = await h.createRunningJob("ses-other");
+    const { delivery, delivered } = h.makeDelivery({
+      // Neither target is live: a global reconcile would mark both jobs lost.
+      liveTargets: async (): Promise<LiveTargets> => ({ live: new Set<string>(), labels: new Map(), serverIdentity: "1:1" }),
+    });
+    await delivery.refresh();
+
+    assert.equal(delivered.length, 1, "only this parent's lost job is delivered");
+    assert.equal(delivered[0]!.details.jobId, mine.jobId);
+    assert.equal((await h.jobs.get(mine.jobId))?.status, "lost");
+    assert.equal((await h.jobs.get(theirs.jobId))?.status, "running", "another parent's job is never reconciled");
+    assert.equal((await h.jobs.get(theirs.jobId))?.notifiedAt, undefined);
+    await delivery.shutdown();
+  } finally {
+    await h.close();
+  }
+});
+
+test("a live job keeps observation quiescent without self-triggering registry writes", async () => {
+  const h = await makeHarness();
+  try {
+    const job = await h.createRunningJob();
+    const { delivery, delivered } = h.makeDelivery({
+      liveTargets: async (): Promise<LiveTargets> => ({ live: new Set(["$1", "%1"]), labels: new Map(), serverIdentity: "1:1" }),
+      watch: defaultCompletionWatchFactory,
+    });
+
+    await delivery.refresh(); // establishes real observation while the job is live
+    assert.equal(delivery.observing, true);
+    const before = await stat(h.jobs.file);
+
+    // A burst of signals while nothing changes must not rewrite the file: every
+    // write is an atomic rename that would re-trigger the real watcher forever.
+    await delivery.refresh();
+    await delivery.refresh();
+    await new Promise((resolve) => setTimeout(resolve, 300));
+    await delivery.refresh();
+
+    const after = await stat(h.jobs.file);
+    assert.equal(after.ino, before.ino, "a no-op pass must not rename the registry file and re-trigger the watcher");
+    assert.equal(after.mtimeMs, before.mtimeMs, "a no-op pass must not write the registry file");
+    assert.equal(delivered.length, 0, "a live job produces no completion event");
+    assert.equal((await h.jobs.get(job.jobId))?.status, "running");
     await delivery.shutdown();
   } finally {
     await h.close();
