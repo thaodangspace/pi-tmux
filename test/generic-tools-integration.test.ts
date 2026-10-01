@@ -6,6 +6,7 @@ import path from "node:path";
 import test from "node:test";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { AgentAdapterRegistry } from "../src/agent-adapter.ts";
+import { OpenCodeAdapter } from "../src/opencode-adapter.ts";
 import { PiAdapter } from "../src/pi-adapter.ts";
 import { defaultChildReporterPath } from "../src/pi-subagent.ts";
 import { Registry } from "../src/registry.ts";
@@ -39,6 +40,15 @@ process.stdin.on("data", (chunk) => { data += chunk; });
 process.stdin.on("end", () => {
   process.stdout.write(JSON.stringify({ session_id: "native-e2e", result: "ok:" + data, is_error: false }) + "\\n");
 });
+`;
+
+const OPENCODE_AGENT_SCRIPT = `#!/usr/bin/env node
+const args = process.argv.slice(2);
+const task = args.length ? args[args.length - 1] : "";
+const emit = (value) => process.stdout.write(JSON.stringify(value) + "\\n");
+emit({ type: "step_start", sessionID: "ses_tools_1", part: { type: "step-start" } });
+emit({ type: "text", sessionID: "ses_tools_1", part: { type: "text", text: "ok:" + task } });
+emit({ type: "step_finish", sessionID: "ses_tools_1", part: { type: "step-finish" } });
 `;
 
 test("generic tools drive a fake Claude Code adapter end to end and deliver durable completion", { skip: !available }, async () => {
@@ -133,6 +143,70 @@ test("generic tools drive a fake Claude Code adapter end to end and deliver dura
     assert.equal(body(closed).targetRemoved, true);
     const live = await targetsLive(tmux);
     assert.equal(live.live.size, 0, "close removed the only owned tmux session");
+  } finally {
+    try { await tmux.run(["kill-server"]); } catch { /* Server may not have started. */ }
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("an OpenCode adapter is driven through the generic tools end to end", { skip: !available }, async () => {
+  const directory = await mkdtemp(path.join(os.tmpdir(), "generic-opencode-e2e-"));
+  const socket = path.join(directory, "s");
+  const tmux = new Tmux({ socket });
+  const sessions = new SubagentSessionRegistry(path.join(directory, "sessions.json"));
+  const agent = path.join(directory, "opencode");
+  await writeFile(agent, OPENCODE_AGENT_SCRIPT, "utf8");
+  await chmod(agent, 0o755);
+
+  try {
+    await runTmux(socket, ["-f", "/dev/null", "new-session", "-d", "-s", "bootstrap"]);
+    await runTmux(socket, ["set-option", "-g", "default-shell", "/bin/sh"]);
+    await runTmux(socket, ["set-option", "-s", "exit-empty", "off"]);
+    await runTmux(socket, ["kill-session", "-t", "bootstrap"]);
+
+    const tools: Record<string, any> = {};
+    registerTmuxTools(
+      { registerTool(tool: any) { tools[tool.name] = tool; } } as unknown as ExtensionAPI,
+      tmux,
+      new Registry(path.join(directory, "registry.json")),
+      {
+        targets: new Targets(tmux),
+        sessions,
+        jobs: new SubagentJobRegistry(path.join(directory, "jobs.json")),
+        adapters: new AgentAdapterRegistry([new OpenCodeAdapter({ opencodeCommand: agent })]),
+      },
+    );
+
+    const owner = "pi-parent";
+    const context = { hasUI: false, sessionManager: { getSessionId: () => owner }, ui: {} } as unknown as ExtensionContext;
+    const call = (name: string, params: Record<string, unknown>) => tools[name].execute("call", params, undefined, undefined, context);
+    const body = (value: any) => JSON.parse(value.content[0].text);
+
+    const created = await call("tmux_subagent_create", { agent: "opencode", cwd: directory, name: "oc-e2e" });
+    assert.equal(created.isError, undefined, created.content[0].text);
+    const sessionId = body(created).sessionId as string;
+    assert.equal(body(created).status, "idle");
+    assert.equal(body(created).metadata.opencodeRuntime, "standalone-private-server", "bounded isolation metadata is surfaced");
+
+    const running = await call("tmux_subagent_run", { sessionId, task: "first turn" });
+    assert.equal(running.isError, undefined, running.content[0].text);
+    const first = await waitForTerminal(sessions, body(running).turnId as string);
+    assert.equal(first.status, "completed");
+    assert.equal((await sessions.getSession(sessionId))?.agentSessionId, "ses_tools_1");
+
+    const second = await call("tmux_subagent_run", { sessionId, task: "second turn" });
+    assert.equal(second.isError, undefined, second.content[0].text);
+    const secondTurn = await waitForTerminal(sessions, body(second).turnId as string);
+    assert.equal(secondTurn.status, "completed");
+    assert.equal((await sessions.getSession(sessionId))?.agentSessionId, "ses_tools_1", "the second turn resumes the same native session");
+
+    const status = await call("tmux_subagent_status", { sessionId });
+    assert.equal(status.isError, undefined);
+    assert.equal(body(status).session.sessionId, sessionId);
+
+    const closed = await call("tmux_subagent_close", { sessionId });
+    assert.equal(closed.isError, undefined, closed.content[0].text);
+    assert.equal(body(closed).status, "stopped");
   } finally {
     try { await tmux.run(["kill-server"]); } catch { /* Server may not have started. */ }
     await rm(directory, { recursive: true, force: true });

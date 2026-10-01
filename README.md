@@ -142,11 +142,11 @@ executable, argv, or shell command: an agent is selected only by the bounded
 - **Status never scrapes panes.** `status` reads the durable session/turn
   registry and reconciles it against a live tmux view; a vanished target becomes
   `lost`, and pane output is never used to infer completion.
-- **Adapters, not argv.** The default registry contains a Pi adapter and a
-  first-class Claude Code adapter (issue #13). Deployers can add or override an
-  `opencode` / `claude-code` runner by supplying a `RunnerSpecV1` map as JSON in
-  `PI_TMUX_AGENT_SPECS` (or the `agentSpecs` option). A malformed spec is ignored
-  rather than guessed, and the model never supplies a command.
+- **Adapters, not argv.** The default registry contains a Pi adapter and
+  first-class Claude Code (issue #13) and OpenCode (issue #14) adapters.
+  Deployers can add or override a runner by supplying a `RunnerSpecV1` map as
+  JSON in `PI_TMUX_AGENT_SPECS` (or the `agentSpecs` option). A malformed spec is
+  ignored rather than guessed, and the model never supplies a command.
 - **Compatibility.** `tmux_subagent_start_pi` and the `jobId` form of
   `status`/`cancel` continue to operate on `SubagentJobV1` records unchanged; a
   stored job ID is never silently reinterpreted as a logical session ID.
@@ -208,8 +208,9 @@ tmux server
   distinct `agent`/`sessionId`/`turnId`), is owner-scoped, observes only while a
   turn is active or undelivered, and acknowledges delivery durably.
 - The generic `RunnerAdapter` never guesses an agent CLI: a deployer supplies the
-  `RunnerSpecV1`. The dedicated `ClaudeCodeAdapter` (below) assembles a bounded,
-  version-stable Claude Code argv internally because Claude Code is first-class.
+  `RunnerSpecV1`. The dedicated `ClaudeCodeAdapter` and `OpenCodeAdapter` (below)
+  assemble a bounded, version-stable argv internally because those agents are
+  first-class.
 
 ## Claude Code adapter (`claude-code`)
 
@@ -252,6 +253,58 @@ tmux session
 - **Testing.** The default suite uses a fake `claude` executable and requires no
   Claude account. A credentialed smoke test is intentionally not part of the
   default run.
+
+## OpenCode adapter (`opencode`)
+
+Issue #14 adds `agent: "opencode"` as a first-class, resumable subagent. It runs
+inside the pi-tmux-owned tmux boundary and uses OpenCode's non-interactive JSON
+run mode rather than TUI scraping:
+
+```text
+tmux session
+  └─ generic runner (src/turn-runner.ts)
+       └─ opencode run --standalone --format json [--model <provider/model>] [--session <id>] <task>
+```
+
+- **Mandatory private-server isolation.** Every managed turn runs
+  `opencode run --standalone`. `--standalone` starts OpenCode's private server
+  inside the owned tmux process tree instead of discovering or starting the
+  shared per-user background service. Killing or losing the owned tmux target
+  therefore tears down the actual agent/session/tool execution; a managed turn
+  can never delegate execution to the shared daemon outside pi-tmux's
+  cancellation boundary. `--attach` is never used.
+- `src/opencode-adapter.ts` (`OpenCodeAdapter`) resolves the `opencode`
+  executable **without a shell**, assembles the finite argv internally, and hands
+  it to the generic runner as a `RunnerSpecV1`. The model never supplies a command
+  or argv.
+- **Resumable turns.** The first turn runs `opencode run --standalone --format
+  json` and the runner captures OpenCode's native `sessionID` (from the
+  structured events) into the logical session's `agentSessionId`. Later turns run
+  `opencode run --standalone --session <agentSessionId> --format json`, resuming
+  exactly that id. `--continue` is never used once a known id exists; a
+  continuation whose logical session has no recorded `agentSessionId` (for
+  example after a failed first turn) is **rejected** so orchestration cannot
+  silently attach to an unrelated conversation. The stored id is validated as a
+  bounded `[A-Za-z0-9._-]+` token before it reaches argv.
+- **Structured completion only.** OpenCode's `--format json` emits newline-
+  delimited events (`step_start`, `text`, `tool_use`, `step_finish`, `error`). The
+  runner records success only from a zero exit code plus parseable output; a
+  reported error, a non-zero exit, a malformed line, or a truncated stream is
+  recorded as `failed`. Pane text is never inspected.
+- **Bounded options and no permission weakening.** `model` is validated against
+  `[A-Za-z0-9._@:/-]+` (e.g. `anthropic/claude-sonnet-4-5`) and passed as
+  `--model`. A `thinking` option is rejected rather than silently ignored.
+  `--auto`, `--yolo`, and `--dangerously-skip-permissions` are never passed, and
+  no global/project OpenCode config is mutated to launch a turn.
+- **Credential handling.** pi-tmux never injects provider credentials and never
+  reads, returns, logs, or persists a credential value. OpenCode keeps its normal
+  provider/account selection from its own stored auth/config and the inherited
+  environment. Preflight surfaces bounded, non-secret isolation metadata
+  (`opencodeRuntime: "standalone-private-server"` plus a note) on
+  `tmux_subagent_create` / `tmux_subagent_run` results.
+- **Testing.** The default suite uses a fake `opencode` executable and requires no
+  OpenCode account or provider credentials. A credentialed smoke test is
+  intentionally not part of the default run.
 
 ## Pi child completion reporter
 
