@@ -9,24 +9,26 @@ import {
   type PiSubagentTargets,
 } from "../src/pi-subagent.ts";
 import { Registry } from "../src/registry.ts";
-import { SubagentJobRegistry } from "../src/subagent-jobs.ts";
+import { SubagentJobRegistry, type SubagentJobV1 } from "../src/subagent-jobs.ts";
 import type { LiveTargets, PaneTarget, SessionTarget } from "../src/targets.ts";
 import { Tmux, TmuxError } from "../src/tmux.ts";
 
 /** In-memory stand-in for one isolated tmux server. */
 class FakeState {
-  serverIdentity = "1:1";
+  serverIdentity: string | undefined = "1:1";
   serverAvailable = true;
-  dieOnLaunch = false;
+  dieOnRespawn = false;
   nextSession = 1;
   nextPane = 1;
   readonly sessions = new Map<string, { id: string; name: string; panes: Set<string> }>();
   readonly paneSession = new Map<string, string>();
   readonly newSessionArgs: string[][] = [];
+  readonly respawnArgs: string[][] = [];
   readonly killArgs: string[][] = [];
   readonly envBySession = new Map<string, Map<string, string>>();
   readonly commandBySession = new Map<string, string>();
   readonly cwdBySession = new Map<string, string>();
+  onRespawn?: (env: Map<string, string>, paneId: string) => void | Promise<void>;
 
   removeSession(sessionId: string): void {
     const session = this.sessions.get(sessionId);
@@ -46,25 +48,37 @@ class FakeTmux extends Tmux {
       this.state.newSessionArgs.push([...args]);
       let name = "session";
       let cwd = "/";
-      const env = new Map<string, string>();
       for (let index = 1; index < args.length; index++) {
         if (args[index] === "-s") name = args[++index]!;
         else if (args[index] === "-c") cwd = args[++index]!;
+      }
+      const sessionId = `$${this.state.nextSession++}`;
+      const paneId = `%${this.state.nextPane++}`;
+      this.state.sessions.set(sessionId, { id: sessionId, name, panes: new Set([paneId]) });
+      this.state.paneSession.set(paneId, sessionId);
+      this.state.cwdBySession.set(sessionId, cwd);
+      return `${sessionId}\t${paneId}`;
+    }
+    if (command === "respawn-pane") {
+      this.state.respawnArgs.push([...args]);
+      let paneId = "";
+      const env = new Map<string, string>();
+      for (let index = 1; index < args.length; index++) {
+        if (args[index] === "-t") paneId = args[++index]!;
         else if (args[index] === "-e") {
           const pair = args[++index]!;
           const split = pair.indexOf("=");
           env.set(pair.slice(0, split), pair.slice(split + 1));
         }
       }
-      const sessionId = `$${this.state.nextSession++}`;
-      const paneId = `%${this.state.nextPane++}`;
-      this.state.sessions.set(sessionId, { id: sessionId, name, panes: new Set([paneId]) });
-      this.state.paneSession.set(paneId, sessionId);
-      this.state.envBySession.set(sessionId, env);
-      this.state.commandBySession.set(sessionId, args.at(-1) ?? "");
-      this.state.cwdBySession.set(sessionId, cwd);
-      if (this.state.dieOnLaunch) this.state.removeSession(sessionId);
-      return `${sessionId}\t${paneId}`;
+      const sessionId = this.state.paneSession.get(paneId);
+      if (sessionId) {
+        this.state.envBySession.set(sessionId, env);
+        this.state.commandBySession.set(sessionId, args.at(-1) ?? "");
+      }
+      if (this.state.onRespawn) await this.state.onRespawn(env, paneId);
+      if (this.state.dieOnRespawn && sessionId) this.state.removeSession(sessionId);
+      return "";
     }
     if (command === "kill-session") {
       this.state.killArgs.push([...args]);
@@ -180,6 +194,31 @@ test("start creates a durable job, binds stable tmux IDs, and delivers the task 
   }
 });
 
+test("Pi cannot start until the job is durably bound and starting", async () => {
+  const h = await makeHarness();
+  try {
+    let observed: SubagentJobV1 | undefined;
+    h.state.onRespawn = async (env) => {
+      observed = await h.jobs.get(env.get("PI_TMUX_SUBAGENT_JOB_ID")!);
+    };
+    const result = await h.controller.start({ cwd: h.dir, task: "task" }, "pi-parent");
+    assert.equal(result.ok, true);
+    if (!result.ok) return;
+
+    assert.ok(observed, "the launch command ran");
+    assert.equal(observed!.status, "starting", "the child only starts after the durable starting transition");
+    assert.equal(observed!.tmuxSessionId, result.tmuxSessionId);
+    assert.equal(observed!.tmuxPaneId, result.tmuxPaneId);
+
+    const placeholder = h.state.newSessionArgs[0]!;
+    assert.equal(placeholder.at(-1), "exec sleep 3600", "the session starts inert");
+    assert.ok(!placeholder.some((arg) => arg.startsWith("PI_TMUX_SUBAGENT_TASK=")), "the task is not present before the gate opens");
+    assert.equal(h.state.respawnArgs.length, 1, "the real launch is a respawn after the transition");
+  } finally {
+    await h.close();
+  }
+});
+
 test("the task is delivered verbatim and is never interpreted by the shell", async () => {
   const h = await makeHarness();
   try {
@@ -230,7 +269,7 @@ test("a missing child reporter fails the durable job without launching", async (
 test("a child that exits during startup fails the job and leaves no owned session", async () => {
   const h = await makeHarness({ startupProbe: { attempts: 2, intervalMs: 1 }, sleep: async () => undefined });
   try {
-    h.state.dieOnLaunch = true;
+    h.state.dieOnRespawn = true;
     const result = await h.controller.start({ cwd: h.dir, task: "task" }, "pi-parent");
     assert.equal(result.ok, false);
     if (result.ok) return;
@@ -260,6 +299,7 @@ test("a binding failure cleans up the tmux session it created and fails the job"
     assert.equal(result.code, "invalid_option");
     assert.equal(result.cleanedUp, true);
     assert.equal(h.state.killArgs.length, 1, "the just-created session is killed, not leaked");
+    assert.equal(h.state.respawnArgs.length, 0, "the child is never started when binding fails");
     assert.equal((await jobs.get(result.jobId!))?.status, "failed");
   } finally {
     await h.close();
@@ -335,7 +375,7 @@ test("status refuses an unknown job or one owned by another Pi conversation", as
   }
 });
 
-test("cancel kills only the recorded target and is idempotent", async () => {
+test("cancel kills only the verified recorded target and is idempotent", async () => {
   const h = await makeHarness();
   try {
     const started = await h.controller.start({ cwd: h.dir, task: "task" }, "pi-parent");
@@ -381,7 +421,7 @@ test("cancel is a no-op on a job the child already completed", async () => {
   }
 });
 
-test("cancel refuses a reused or unrelated pane instead of killing it", async () => {
+test("cancel fails closed (no kill) when the recorded pane belongs to another session", async () => {
   const h = await makeHarness();
   try {
     const started = await h.controller.start({ cwd: h.dir, task: "task" }, "pi-parent");
@@ -391,17 +431,61 @@ test("cancel refuses a reused or unrelated pane instead of killing it", async ()
     h.state.paneSession.set(started.tmuxPaneId, "$999");
 
     const cancelled = await h.controller.cancel(started.jobId, "pi-parent");
-    assert.equal(cancelled.ok, false);
-    if (cancelled.ok) return;
-    assert.equal(cancelled.code, "invalid_target");
-    assert.equal(h.state.killArgs.length, 0, "no unrelated target is killed");
-    assert.equal((await h.jobs.get(started.jobId))?.status, "starting", "the job is left for review");
+    assert.equal(cancelled.ok, true);
+    if (!cancelled.ok) return;
+    assert.equal(cancelled.targetRemoved, false, "no reused target is killed");
+    assert.equal(h.state.killArgs.length, 0);
+    assert.match(cancelled.reason, /now belongs to session/);
+    assert.equal((await h.jobs.get(started.jobId))?.status, "cancelled");
   } finally {
     await h.close();
   }
 });
 
-test("cancel refuses a target bound to a different tmux server", async () => {
+test("cancel fails closed (no kill) when the recorded pane is missing but the session is live", async () => {
+  const h = await makeHarness();
+  try {
+    const started = await h.controller.start({ cwd: h.dir, task: "task" }, "pi-parent");
+    assert.equal(started.ok, true);
+    if (!started.ok) return;
+    // Keep the session, drop only the pane: the stable pane ID may be reused.
+    h.state.sessions.get(started.tmuxSessionId)!.panes.clear();
+    h.state.paneSession.delete(started.tmuxPaneId);
+
+    const cancelled = await h.controller.cancel(started.jobId, "pi-parent");
+    assert.equal(cancelled.ok, true);
+    if (!cancelled.ok) return;
+    assert.equal(cancelled.targetRemoved, false);
+    assert.equal(h.state.killArgs.length, 0);
+    assert.match(cancelled.reason, /not present/);
+  } finally {
+    await h.close();
+  }
+});
+
+test("cancel fails closed (no kill) when the job has no recorded server identity", async () => {
+  const h = await makeHarness();
+  try {
+    const job = await h.jobs.create({ cwd: h.dir, parentPiSessionId: "pi-parent" });
+    await h.jobs.bind(job.jobId, { tmuxSessionId: "$1", tmuxPaneId: "%1" }); // no serverIdentity
+    await h.jobs.transition(job.jobId, "starting");
+    // The fake server still has a live $1/%1, but without a recorded identity it
+    // cannot be proven to be the same server, so cancel must not kill it.
+    h.state.sessions.set("$1", { id: "$1", name: "s", panes: new Set(["%1"]) });
+    h.state.paneSession.set("%1", "$1");
+
+    const cancelled = await h.controller.cancel(job.jobId, "pi-parent");
+    assert.equal(cancelled.ok, true);
+    if (!cancelled.ok) return;
+    assert.equal(cancelled.targetRemoved, false);
+    assert.equal(h.state.killArgs.length, 0);
+    assert.match(cancelled.reason, /no recorded tmux server identity/);
+  } finally {
+    await h.close();
+  }
+});
+
+test("cancel fails closed (no kill) when the server identity changed", async () => {
   const h = await makeHarness();
   try {
     const started = await h.controller.start({ cwd: h.dir, task: "task" }, "pi-parent");
@@ -409,10 +493,29 @@ test("cancel refuses a target bound to a different tmux server", async () => {
     if (!started.ok) return;
     h.state.serverIdentity = "2:2";
     const cancelled = await h.controller.cancel(started.jobId, "pi-parent");
-    assert.equal(cancelled.ok, false);
-    if (cancelled.ok) return;
-    assert.equal(cancelled.code, "invalid_target");
+    assert.equal(cancelled.ok, true);
+    if (!cancelled.ok) return;
+    assert.equal(cancelled.targetRemoved, false);
     assert.equal(h.state.killArgs.length, 0);
+    assert.match(cancelled.reason, /current server is 2:2/);
+  } finally {
+    await h.close();
+  }
+});
+
+test("cancel fails closed (no kill) when the current server identity is unavailable", async () => {
+  const h = await makeHarness();
+  try {
+    const started = await h.controller.start({ cwd: h.dir, task: "task" }, "pi-parent");
+    assert.equal(started.ok, true);
+    if (!started.ok) return;
+    h.state.serverIdentity = undefined;
+    const cancelled = await h.controller.cancel(started.jobId, "pi-parent");
+    assert.equal(cancelled.ok, true);
+    if (!cancelled.ok) return;
+    assert.equal(cancelled.targetRemoved, false);
+    assert.equal(h.state.killArgs.length, 0);
+    assert.match(cancelled.reason, /server identity is unavailable/);
   } finally {
     await h.close();
   }

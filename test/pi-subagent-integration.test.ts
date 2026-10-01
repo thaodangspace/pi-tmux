@@ -17,9 +17,9 @@ const available = await new Promise<boolean>((resolve) => {
   child.on("close", (code) => resolve(code === 0));
 });
 
-/** A fake Pi CLI that records exactly what it received, then stays alive. */
-async function writeFakePi(file: string, body: string): Promise<string> {
-  await writeFile(file, `#!/bin/sh\n${body}\n`, "utf8");
+/** Writes an executable fake CLI script (the body must include its own shebang). */
+async function writeExecutable(file: string, body: string): Promise<string> {
+  await writeFile(file, `${body}\n`, "utf8");
   await chmod(file, 0o755);
   return file;
 }
@@ -47,7 +47,8 @@ test("a Pi subagent launches in an isolated tmux server, receives the task verba
     await runTmux(socket, ["set-option", "-s", "exit-empty", "off"]);
     await runTmux(socket, ["kill-session", "-t", "bootstrap"]);
 
-    const fakePi = await writeFakePi(path.join(directory, "pi"), [
+    const fakePi = await writeExecutable(path.join(directory, "pi"), [
+      "#!/bin/sh",
       `printf '%s' "$PI_TMUX_SUBAGENT_TASK" > '${taskFile}'`,
       `printf 'JOB=%s\\nPARENT=%s\\nSTATE=%s\\nREPORTER=%s\\n' "$PI_TMUX_SUBAGENT_JOB_ID" "$PI_TMUX_PARENT_SESSION_ID" "$PI_TMUX_SUBAGENT_STATE" "$PI_TMUX_CHILD_REPORTER" > '${metaFile}'`,
       `printf '%s' "$*" > '${argvFile}'`,
@@ -100,6 +101,57 @@ test("a Pi subagent launches in an isolated tmux server, receives the task verba
   }
 });
 
+test("a child Pi observes the job already bound and starting on its very first read", { skip: !available }, async () => {
+  const directory = await mkdtemp(path.join(os.tmpdir(), "pi-subagent-int-"));
+  const socket = path.join(directory, "s");
+  const statusFile = path.join(directory, "status.json");
+  const tmux = new Tmux({ socket });
+  try {
+    await runTmux(socket, ["-f", "/dev/null", "new-session", "-d", "-s", "bootstrap"]);
+    await runTmux(socket, ["set-option", "-g", "default-shell", "/bin/sh"]);
+    await runTmux(socket, ["set-option", "-s", "exit-empty", "off"]);
+    await runTmux(socket, ["kill-session", "-t", "bootstrap"]);
+
+    // A child that reads the durable registry the instant it starts and records
+    // exactly what it saw. If the startup gate were missing, this could observe
+    // a `created`/unbound job and the real reporter would reject it.
+    const fakePi = await writeExecutable(path.join(directory, "pi"), [
+      "#!/usr/bin/env node",
+      'const fs = require("node:fs");',
+      'const state = JSON.parse(fs.readFileSync(process.env.PI_TMUX_SUBAGENT_STATE, "utf8"));',
+      'const job = state.jobs.find((j) => j.jobId === process.env.PI_TMUX_SUBAGENT_JOB_ID);',
+      `fs.writeFileSync(${JSON.stringify(statusFile)}, JSON.stringify({ status: job && job.status, session: job && job.tmuxSessionId, pane: job && job.tmuxPaneId, task: process.env.PI_TMUX_SUBAGENT_TASK }));`,
+      "setTimeout(() => {}, 60000);",
+    ].join("\n"));
+
+    const targets = new Targets(tmux);
+    const controller = new PiSubagentController({
+      tmux,
+      registry: new Registry(path.join(directory, "registry.json")),
+      jobs: new SubagentJobRegistry(path.join(directory, "jobs.json")),
+      targets,
+      reporterPath: defaultChildReporterPath(),
+      resolvePi: async () => fakePi,
+      startupProbe: { attempts: 0, intervalMs: 0 },
+    });
+
+    const started = await controller.start({ cwd: directory, task: "ready?" }, "pi-parent");
+    assert.equal(started.ok, true);
+    if (!started.ok) return;
+    assert.equal(await waitForFile(statusFile), true, "the child never recorded its first read");
+    const seen = JSON.parse(await readFile(statusFile, "utf8"));
+    assert.equal(seen.status, "starting", "the job was already starting before the child read it");
+    assert.equal(seen.session, started.tmuxSessionId);
+    assert.equal(seen.pane, started.tmuxPaneId);
+    assert.equal(seen.task, "ready?");
+
+    await controller.cancel(started.jobId, "pi-parent");
+  } finally {
+    try { await tmux.run(["kill-server"]); } catch { /* Server may not have started. */ }
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
 test("an early-exiting child fails the job and leaves no owned session", { skip: !available }, async () => {
   const directory = await mkdtemp(path.join(os.tmpdir(), "pi-subagent-int-"));
   const socket = path.join(directory, "s");
@@ -110,7 +162,7 @@ test("an early-exiting child fails the job and leaves no owned session", { skip:
     await runTmux(socket, ["set-option", "-s", "exit-empty", "off"]);
     await runTmux(socket, ["kill-session", "-t", "bootstrap"]);
 
-    const fakePi = await writeFakePi(path.join(directory, "pi"), "exit 7");
+    const fakePi = await writeExecutable(path.join(directory, "pi"), "#!/bin/sh\nexit 7");
     const targets = new Targets(tmux);
     const controller = new PiSubagentController({
       tmux,

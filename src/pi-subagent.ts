@@ -54,6 +54,16 @@ export const PI_SUBAGENT_ENV = {
  */
 export const PI_SUBAGENT_LAUNCH_COMMAND = 'exec "$PI_TMUX_PI_BIN" --extension "$PI_TMUX_CHILD_REPORTER" --mode json -p -- "$PI_TMUX_SUBAGENT_TASK"';
 
+/**
+ * Startup gate. The tmux session is first created running only this inert
+ * placeholder, so Pi cannot start until the parent has durably bound the job
+ * and moved it to `starting`. The pane is then replaced with the real launch
+ * command via `respawn-pane` (which keeps the stable `%N` pane ID). This makes
+ * a fast child reporter's `session_start` deterministic: it can never observe a
+ * job that is still `created`/unbound.
+ */
+export const PI_SUBAGENT_PLACEHOLDER_COMMAND = "exec sleep 3600";
+
 export const PI_SUBAGENT_TOOL = "tmux_subagent_start_pi";
 export const DEFAULT_PI_COMMAND = "pi";
 const DEFAULT_MAX_DEPTH = 8;
@@ -246,20 +256,14 @@ export class PiSubagentController {
     const name = sessionName(input.name, job.jobId);
     let sessionId: string;
     let paneId: string;
+    // The session starts inert. Pi is launched later with `respawn-pane`, after
+    // the durable bind + `starting` transition, so the child can never observe
+    // an unbound/`created` job even if it reports instantly.
     const createArgs = [
       "new-session", "-d", "-P", "-F", "#{session_id}\t#{pane_id}",
       "-s", name,
       "-c", cwd,
-      "-e", `${PI_SUBAGENT_ENV.piBin}=${piBin}`,
-      "-e", `${PI_SUBAGENT_ENV.reporter}=${this.reporterPath}`,
-      "-e", `${CHILD_REPORTER_ENV.jobId}=${job.jobId}`,
-      "-e", `${CHILD_REPORTER_ENV.state}=${this.jobs.file}`,
-      "-e", `${CHILD_REPORTER_ENV.parentSessionId}=${parentPiSessionId}`,
-      ...(ancestors.length ? ["-e", `${CHILD_REPORTER_ENV.ancestors}=${ancestors.join(",")}`] : []),
-      "-e", `${PI_SUBAGENT_ENV.task}=${task}`,
-      ...(input.model ? ["-e", `${PI_SUBAGENT_ENV.model}=${input.model}`] : []),
-      ...(input.thinking ? ["-e", `${PI_SUBAGENT_ENV.thinking}=${input.thinking}`] : []),
-      launchCommand(Boolean(input.model), Boolean(input.thinking)),
+      PI_SUBAGENT_PLACEHOLDER_COMMAND,
     ];
     try {
       const [createdSession, createdPane] = singleRow(await this.tmux.run(createArgs, { signal }), 2);
@@ -290,6 +294,30 @@ export class PiSubagentController {
     } catch (error) {
       const cleanedUp = await this.cleanupSession(sessionId, signal);
       const message = `Could not bind the subagent job to its tmux target: ${errorMessage(error)}`;
+      await this.failJob(job.jobId, message);
+      return { ok: false, code: codeOf(error), error: message, jobId: job.jobId, status: "failed", cleanedUp };
+    }
+
+    // The job is now durably bound and `starting`; only now may Pi start. The
+    // respawn keeps the same stable pane ID and carries the launch environment.
+    const launchArgs = [
+      "respawn-pane", "-k", "-t", paneId,
+      "-e", `${PI_SUBAGENT_ENV.piBin}=${piBin}`,
+      "-e", `${PI_SUBAGENT_ENV.reporter}=${this.reporterPath}`,
+      "-e", `${CHILD_REPORTER_ENV.jobId}=${job.jobId}`,
+      "-e", `${CHILD_REPORTER_ENV.state}=${this.jobs.file}`,
+      "-e", `${CHILD_REPORTER_ENV.parentSessionId}=${parentPiSessionId}`,
+      ...(ancestors.length ? ["-e", `${CHILD_REPORTER_ENV.ancestors}=${ancestors.join(",")}`] : []),
+      "-e", `${PI_SUBAGENT_ENV.task}=${task}`,
+      ...(input.model ? ["-e", `${PI_SUBAGENT_ENV.model}=${input.model}`] : []),
+      ...(input.thinking ? ["-e", `${PI_SUBAGENT_ENV.thinking}=${input.thinking}`] : []),
+      launchCommand(Boolean(input.model), Boolean(input.thinking)),
+    ];
+    try {
+      await this.tmux.run(launchArgs, { signal });
+    } catch (error) {
+      const cleanedUp = await this.cleanupSession(sessionId, signal);
+      const message = `Could not start the child Pi process: ${errorMessage(error)}`;
       await this.failJob(job.jobId, message);
       return { ok: false, code: codeOf(error), error: message, jobId: job.jobId, status: "failed", cleanedUp };
     }
@@ -361,11 +389,13 @@ export class PiSubagentController {
   }
 
   /**
-   * Cancels exactly one job. The job is moved to `cancelled`, then only the
-   * stable tmux session recorded on that job is killed after verifying the
-   * server identity and that the recorded pane still belongs to it. A terminal
-   * job (including one already cancelled or completed by the child) is returned
-   * unchanged, so repeated cancellation is idempotent.
+   * Cancels exactly one job. The job is moved to `cancelled`, and the tmux
+   * session is killed **only** when the exact recorded pane is present in the
+   * exact recorded session on the exact recorded tmux server. If the server
+   * identity is unknown/mismatched, the pane is missing, or the pane now belongs
+   * to another session, the kill is skipped (fail closed) rather than risk
+   * killing a reused ID. A terminal job is returned unchanged, so repeated
+   * cancellation is idempotent.
    */
   async cancel(jobId: string, parentPiSessionId: string, signal?: AbortSignal): Promise<PiSubagentCancelResult> {
     const found = await this.lookup(jobId, parentPiSessionId);
@@ -391,22 +421,32 @@ export class PiSubagentController {
       return { ok: true, jobId: job.jobId, status: cancelled.status, alreadyTerminal: false, targetRemoved: false, reason: "tmux server unavailable; recorded target left untouched." };
     }
 
-    if (job.serverIdentity !== undefined && view.serverIdentity !== undefined && job.serverIdentity !== view.serverIdentity) {
-      return fail("invalid_target", `Refusing to cancel job ${job.jobId}: its target belonged to tmux server ${job.serverIdentity} but the current server is ${view.serverIdentity}.`, job.jobId);
-    }
+    // Positive identity: both sides must name the same server, and the exact
+    // recorded pane must exist inside the exact recorded session.
+    const identityVerified = job.serverIdentity !== undefined
+      && view.serverIdentity !== undefined
+      && job.serverIdentity === view.serverIdentity;
     const pane = panes.find((item) => item.id === job.tmuxPaneId);
-    if (pane && pane.sessionId !== job.tmuxSessionId) {
-      return fail("invalid_target", `Refusing to cancel job ${job.jobId}: pane ${job.tmuxPaneId} now belongs to session ${pane.sessionId}, not the recorded ${job.tmuxSessionId}.`, job.jobId);
-    }
+    const paneVerified = pane !== undefined && pane.sessionId === job.tmuxSessionId;
+    const canKill = identityVerified && paneVerified;
 
     const cancelled = await this.jobs.transition(job.jobId, "cancelled");
-    const sessionLive = view.live.has(job.tmuxSessionId);
-    if (!pane && !sessionLive) {
-      return { ok: true, jobId: job.jobId, status: cancelled.status, alreadyTerminal: false, targetRemoved: false, reason: "The recorded tmux target was already gone." };
+    if (!canKill) {
+      const reason = !identityVerified
+        ? (job.serverIdentity === undefined
+          ? "Refusing to kill: the job has no recorded tmux server identity, so the target cannot be verified."
+          : view.serverIdentity === undefined
+            ? "Refusing to kill: the current tmux server identity is unavailable, so the target cannot be verified."
+            : `Refusing to kill: the job's target belonged to tmux server ${job.serverIdentity} but the current server is ${view.serverIdentity}.`)
+        : pane === undefined
+          ? `Refusing to kill: the recorded pane ${job.tmuxPaneId} is not present; its stable ID may have been reused.`
+          : `Refusing to kill: pane ${job.tmuxPaneId} now belongs to session ${pane.sessionId}, not the recorded ${job.tmuxSessionId}.`;
+      return { ok: true, jobId: job.jobId, status: cancelled.status, alreadyTerminal: false, targetRemoved: false, reason };
     }
+
     await this.tmux.run(["kill-session", "-t", job.tmuxSessionId], { signal });
     await this.registry.forget("session", job.tmuxSessionId).catch(() => 0);
-    return { ok: true, jobId: job.jobId, status: cancelled.status, alreadyTerminal: false, targetRemoved: true, reason: "Killed the recorded tmux session." };
+    return { ok: true, jobId: job.jobId, status: cancelled.status, alreadyTerminal: false, targetRemoved: true, reason: "Killed the verified recorded tmux session." };
   }
 
   private async lookup(jobId: string, parentPiSessionId: string): Promise<SubagentJobV1 | PiSubagentFailure> {
