@@ -123,11 +123,13 @@ export class PiAdapter implements AgentAdapter {
   async prepareTurn(input: SubagentTurnOptions, context: AgentTurnContext): Promise<AgentLaunchSpec> {
     const withModel = Boolean(input.model);
     const withThinking = Boolean(input.thinking);
+    const sessionMode = context.ledgerKind === "session";
     const env: Record<string, string> = {
       [CHILD_REPORTER_ENV.jobId]: context.runId,
       [CHILD_REPORTER_ENV.state]: context.statePath,
       [CHILD_REPORTER_ENV.parentSessionId]: context.owner,
       [PI_SUBAGENT_ENV.task]: input.task,
+      ...(sessionMode ? { [CHILD_REPORTER_ENV.mode]: "session", [CHILD_REPORTER_ENV.session]: context.sessionId } : {}),
     };
     if (context.ancestors.length) env[CHILD_REPORTER_ENV.ancestors] = context.ancestors.join(",");
     if (withModel) env[PI_SUBAGENT_ENV.model] = input.model!;

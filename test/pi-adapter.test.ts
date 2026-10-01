@@ -104,6 +104,23 @@ test("the Pi adapter lineage inherits and de-duplicates the child reporter ances
   assert.deepEqual(adapter.lineage({}), []);
 });
 
+test("the Pi adapter emits the session-mode child-reporter contract for a reusable session turn", async () => {
+  const adapter = new PiAdapter();
+  const spec = await adapter.prepareTurn(
+    { cwd: "/work", task: "do work" },
+    context({ runId: "turn-9", sessionId: "session-7", statePath: "/state/subagent-sessions.json", ledgerKind: "session" }),
+  );
+  assert.equal(spec.env[CHILD_REPORTER_ENV.mode], "session");
+  assert.equal(spec.env[CHILD_REPORTER_ENV.session], "session-7");
+  assert.equal(spec.env[CHILD_REPORTER_ENV.jobId], "turn-9");
+  assert.equal(spec.env[CHILD_REPORTER_ENV.state], "/state/subagent-sessions.json");
+  assert.equal(spec.env[PI_SUBAGENT_ENV.task], "do work");
+  assert.equal(spec.completion.strategy, "native-reporter");
+
+  const jobMode = await adapter.prepareTurn({ cwd: "/work", task: "x" }, context({ ledgerKind: "job" }));
+  assert.equal(jobMode.env[CHILD_REPORTER_ENV.mode], undefined, "a one-shot job launch never sets session mode");
+});
+
 test("the adapter registry dispatches by agent name and rejects an unknown adapter", () => {
   const pi = new PiAdapter();
   const registry = new AgentAdapterRegistry([pi]);

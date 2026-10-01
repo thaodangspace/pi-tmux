@@ -27,7 +27,7 @@ export default function tmuxControlExtension(pi: ExtensionAPI): void {
   // quiescent for Pi-only conversations.
   let turnDelivery: TurnCompletionDelivery | undefined;
 
-  registerTmuxTools(pi, tmux, registry, { jobs, targets });
+  registerTmuxTools(pi, tmux, registry, { jobs, sessions, targets });
   registerTmuxUi(pi, { tmux, registry });
 
   pi.on("session_start", async (_event, ctx) => {

@@ -20,7 +20,7 @@ Input tools: `tmux_send_text` and `tmux_send_key` send literal text or one restr
 
 Guarded tools: `tmux_kill_session`, `tmux_kill_window`, and `tmux_kill_pane`.
 
-Pi subagent tools: `tmux_subagent_start_pi`, `tmux_subagent_status`, and `tmux_subagent_cancel` are the first-class entrypoint for delegating to a **Pi** child. They create a durable subagent job, own a dedicated detached tmux session, always load the packaged child completion reporter, deliver the task without shell interpolation, and return immediately. The generic `tmux_*` tools remain available and unchanged for every other agent. See [Pi subagent tools](#pi-subagent-tools-parent-side).
+Pi subagent tools: the preferred, agent-neutral surface is `tmux_subagent_create` / `tmux_subagent_run` / `tmux_subagent_status` / `tmux_subagent_cancel` / `tmux_subagent_close`, which create and reuse a logical subagent session across turns. `tmux_subagent_start_pi` is the compatibility entrypoint for a one-shot **Pi** child job. Both create a durable record, own a dedicated detached tmux session, deliver the task without shell interpolation, and return immediately. The generic `tmux_*` tools remain available and unchanged for every other agent. See [Generic subagent session/turn tools](#generic-subagent-sessionturn-tools-preferred).
 
 Use stable IDs from list/inspect results (`$N` session, `@N` window, `%N` pane) as targets. Exact human-readable selectors are accepted only when unambiguous. Mutations always resolve a target first and use its stable ID; there is no fallback to another target. Names are limited to 64 characters and cannot contain control characters. Working directories must already exist. Resize dimensions are 1–500 cells. Named keys are restricted to Enter, Escape, Tab, BTab, Space, Backspace, Delete, arrows, Home, End, PageUp, PageDown, and the documented `C-*` keys in the tool description.
 
@@ -111,6 +111,45 @@ adapter, so adding Claude Code or OpenCode does not copy tmux or lifecycle logic
   its `details` now also carry optional `agent`/`sessionId`/`turnId` identity
   (for a one-run job all three equal the `jobId`).
 
+## Generic subagent session/turn tools (preferred)
+
+Issue #12 exposes the session/turn lifecycle as the agent-neutral, model-facing
+surface. No generic tool names an agent, and no generic tool accepts an
+executable, argv, or shell command: an agent is selected only by the bounded
+`agent` enum, and its launch/parse strategy comes from a registered adapter.
+
+| Tool | Semantics |
+|---|---|
+| `tmux_subagent_create` | `{ agent, cwd, name?, parent?, model?, thinking? }` -> `{ sessionId, agent, status, tmuxSessionId, … }`. Creates a reusable session and its tmux boundary; starts **no** turn. |
+| `tmux_subagent_run` | `{ sessionId, task, model?, thinking? }` -> `{ sessionId, turnId, status, tmuxSessionId, tmuxPaneId, turnIndex }`. Creates and launches one turn on the session; rejects a second concurrent turn. |
+| `tmux_subagent_status` | `{ sessionId, turnId? }` for a session/turn, or `{ jobId }` for the legacy Pi job API. Durable state only; reconciles a vanished/re-identified target to `lost` when tmux is reachable. |
+| `tmux_subagent_cancel` | `{ sessionId, turnId? }` cancels the active turn and leaves the session reusable; `{ jobId }` keeps the legacy Pi job behavior. |
+| `tmux_subagent_close` | `{ sessionId }` cancels any active turn, stops the session, and tears down only its verified tmux session. |
+
+- **Ownership.** Every mutating and read operation is scoped to the calling
+  `parentPiSessionId`. A session owned by another Pi conversation can never be
+  run, cancelled, closed, or inspected; the refusal is reported as
+  `invalid_target` with the `sessionId`.
+- **One turn at a time.** `tmux_subagent_run` rejects a second `queued`/`starting`
+  /`running` turn on the same session. A terminal turn never terminates the
+  session: it returns to `idle`, and the next `run` resumes the same native
+  conversation through the recorded `agentSessionId`.
+- **cancel vs close.** `cancel` stops only the active turn's positively verified
+  pane (`kill-pane`), leaving the session boundary intact; `close` cancels any
+  active turn, transitions the session to `stopped`, and kills `$N` only when the
+  recorded `serverIdentity` still matches and the stable ID is live. An
+  unverified or reused target is never killed (fail closed).
+- **Status never scrapes panes.** `status` reads the durable session/turn
+  registry and reconciles it against a live tmux view; a vanished target becomes
+  `lost`, and pane output is never used to infer completion.
+- **Adapters, not argv.** The default registry contains a Pi adapter. Deployers
+  can enable `claude-code` / `opencode` by supplying a `RunnerSpecV1` map as JSON
+  in `PI_TMUX_AGENT_SPECS` (or the `agentSpecs` option). A malformed spec is
+  ignored rather than guessed, and the model never supplies a command.
+- **Compatibility.** `tmux_subagent_start_pi` and the `jobId` form of
+  `status`/`cancel` continue to operate on `SubagentJobV1` records unchanged; a
+  stored job ID is never silently reinterpreted as a logical session ID.
+
 ## Generic turn runner for non-Pi agents
 
 Issue #11 adds one packaged, agent-neutral runner that executes exactly one turn
@@ -189,8 +228,10 @@ pi --extension <package-root>/extensions/child-reporter.ts --mode json -p "…ta
 | `PI_TMUX_SUBAGENT_STATE` | yes | Absolute path to the parent's subagent job registry file (`PI_TMUX_SUBAGENT_JOBS` or its default). A relative path is rejected. |
 | `PI_TMUX_PARENT_SESSION_ID` | conditional | Parent Pi session id. When the job records a parent it must match; when the job records a parent and the variable is absent the metadata is rejected as incomplete. |
 | `PI_TMUX_SUBAGENT_ANCESTORS` | no | Comma-separated job IDs already active in the child's ancestry. The reporter refuses to run when its own job id appears here, then adds its own id so grandchildren inherit the lineage (the recursive-loop guard). |
+| `PI_TMUX_CHILD_REPORTER_MODE` | no | `session` switches the reporter to the generalized session/turn registry (issue #12). Absent means the one-shot job contract above. |
+| `PI_TMUX_SUBAGENT_SESSION_ID` | session mode | The logical `SubagentSessionV1.sessionId` the turn belongs to; `PI_TMUX_SUBAGENT_JOB_ID` is then the `SubagentTurnV1.turnId` and `PI_TMUX_SUBAGENT_STATE` names the session registry file. |
 
-Launch contract: the parent creates and binds the job, transitions it `created -> starting`, and only then starts the child with the variables above. The child's `TMUX_PANE` is checked against the job's bound `%N` pane when it is present, so a reporter loaded in the wrong pane is rejected rather than misreporting. `tmux_subagent_start_pi` performs exactly this contract for Pi; the manual flow is only needed for another agent or a hand-rolled launch.
+Launch contract: the parent creates and binds the job (or session + turn), transitions it `created -> starting` (`starting` for a turn), and only then starts the child with the variables above. The child's `TMUX_PANE` is checked against the bound `%N` pane when it is present, so a reporter loaded in the wrong pane is rejected rather than misreporting. `tmux_subagent_start_pi` performs exactly this contract for a one-shot Pi job; `tmux_subagent_run` performs the session/turn variant. The manual flow is only needed for another agent or a hand-rolled launch.
 
 ### Lifecycle and completion
 
@@ -318,12 +359,15 @@ When a terminal job owned by this conversation is found, the extension injects a
   display: true,
   details: {
     version: 1,
-    jobId: string,
+    jobId: string,          // the turn id for a session/turn completion
     status: "completed" | "failed" | "cancelled" | "lost",
     completionSeq: number,
     finishedAt: string,
     resultPath?: string,
-    error?: string
+    error?: string,
+    agent?: string,         // session/turn identity (issue #12)
+    sessionId?: string,
+    turnId?: string
   }
 }
 ```

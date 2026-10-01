@@ -74,8 +74,10 @@ test("a Pi subagent launches in an isolated tmux server, receives the task verba
     assert.equal(await waitForFile(taskFile), true, "the fake Pi never recorded its task");
     assert.equal(await readFile(taskFile, "utf8"), task, "the task is delivered byte-for-byte");
     assert.equal(existsSync(marker), false, "shell metacharacters in the task are never executed");
+    assert.equal(await waitForFile(argvFile), true, "the fake Pi never recorded its argv");
     const argv = await readFile(argvFile, "utf8");
     assert.ok(argv.includes(task), "the task arrives as a single option-terminated argument");
+    assert.equal(await waitForFile(metaFile), true, "the fake Pi never recorded its launch metadata");
     const meta = await readFile(metaFile, "utf8");
     assert.match(meta, new RegExp(`JOB=${started.jobId}`));
     assert.match(meta, /PARENT=pi-parent/);

@@ -3,8 +3,8 @@ import { access, realpath, stat } from "node:fs/promises";
 import path from "node:path";
 import type { AgentAdapter, AgentTurnContext, SubagentTurnOptions } from "./agent-adapter.ts";
 import type { Registry } from "./registry.ts";
-import type { SubagentAgent, SubagentSessionStatus } from "./subagent-sessions.ts";
 import type { LiveTargets, PaneTarget, SessionTarget } from "./targets.ts";
+import { isTerminalSessionStatus, type SubagentAgent, type SubagentSessionStatus } from "./subagent-sessions.ts";
 import { Tmux, TmuxError, errorMessage } from "./tmux.ts";
 
 /**
@@ -124,10 +124,16 @@ export interface SubagentLedger {
   createTurn?(sessionId: string, owner?: string): Promise<SubagentRunRecord>;
   getSession?(sessionId: string): Promise<SubagentSessionInfo | undefined>;
   stopSession?(sessionId: string, owner?: string): Promise<void>;
+  /** Applies a legal session-status transition (session ledgers only). */
+  transitionSession?(sessionId: string, status: SubagentSessionStatus, owner?: string): Promise<SubagentSessionInfo>;
 
   bindRun(runId: string, input: BindSubagentRunInput, owner?: string): Promise<SubagentRunRecord>;
   transitionRun(runId: string, status: SubagentRunStatus, options?: TransitionSubagentRunOptions, owner?: string): Promise<SubagentRunRecord>;
   cancelRun(runId: string, options?: { error?: string }, owner?: string): Promise<SubagentRunRecord>;
+  /** Cancel exactly one turn, leaving its logical session reusable. Session ledgers only. */
+  cancelTurn?(runId: string, options?: { error?: string }, owner?: string): Promise<SubagentRunRecord>;
+  /** All turns of one logical session, oldest first. Session ledgers only. */
+  listTurns?(sessionId: string): Promise<SubagentRunRecord[]>;
   getRun(runId: string): Promise<SubagentRunRecord | undefined>;
   reconcileRuns(view: SubagentLiveView, options?: { owner?: string }): Promise<SubagentRunRecord[]>;
 }
@@ -184,6 +190,48 @@ export type SubagentStatusResult =
 
 export type SubagentCancelResult =
   | { ok: true; runId: string; status: SubagentRunStatus; alreadyTerminal: boolean; targetRemoved: boolean; reason: string }
+  | SubagentFailure;
+
+export interface SubagentCreateSuccess {
+  ok: true;
+  sessionId: string;
+  agent: SubagentAgent;
+  status: SubagentSessionStatus;
+  tmuxSessionId: string;
+  name: string;
+  cwd: string;
+  owner: string;
+  serverIdentity?: string;
+}
+
+export type SubagentCreateResult = SubagentCreateSuccess | SubagentFailure;
+
+export type SubagentSessionStatusResult =
+  | {
+    ok: true;
+    session: SubagentSessionInfo;
+    turns: SubagentRunRecord[];
+    turn?: SubagentRunRecord;
+    activeTurnId?: string;
+    reconciled: boolean;
+    tmuxUnavailable?: boolean;
+  }
+  | SubagentFailure;
+
+export type SubagentCancelTurnResult =
+  | {
+    ok: true;
+    sessionId: string;
+    turnId?: string;
+    status: SubagentRunStatus;
+    alreadyTerminal: boolean;
+    targetRemoved: boolean;
+    reason: string;
+  }
+  | SubagentFailure;
+
+export type SubagentCloseResult =
+  | { ok: true; sessionId: string; status: SubagentSessionStatus; alreadyClosed: boolean; targetRemoved: boolean; reason: string }
   | SubagentFailure;
 
 export const DEFAULT_MAX_DEPTH = 8;
@@ -254,17 +302,20 @@ export class SubagentController {
     if (this.ledger.tmuxStrategy !== "host-window" || !this.ledger.getSession || !this.ledger.createTurn || !this.ledger.bindRun) {
       return fail("invalid_option", "This agent does not support multiple turns on one session.");
     }
-    const pre = await this.validateStart(input, owner);
-    if (!pre.ok) return pre.failure;
-    const { cwd, ancestors } = pre;
-
-    const preflight = await this.adapter.preflight(input);
-    if (!preflight.ok) return { ok: false, code: preflight.code, error: preflight.error, sessionId };
-
     const session = await this.ledger.getSession(sessionId).catch(() => undefined);
     if (!session) return fail("invalid_target", `Unknown subagent session ${JSON.stringify(sessionId)}.`);
     if (session.owner !== null && session.owner !== owner) {
       return fail("invalid_target", `Subagent session ${sessionId} belongs to another Pi conversation; refusing to control it.`);
+    }
+    const pre = this.validateCommon(input, owner);
+    if (!pre.ok) return pre.failure;
+    const { ancestors } = pre;
+    // The working directory is the durable session's, never caller-supplied, so a
+    // later turn cannot silently retarget the same logical session.
+    const cwd = session.cwd;
+
+    if (isTerminalSessionStatus(session.status)) {
+      return fail("invalid_option", `Subagent session ${sessionId} is ${session.status}; it cannot start another turn.`);
     }
     if (session.tmuxSessionId === null) {
       return fail("invalid_option", `Subagent session ${sessionId} has no bound tmux target.`);
@@ -274,12 +325,18 @@ export class SubagentController {
     // new turn at a reused or vanished ID.
     try {
       const view = await this.targets.liveTargets(signal);
-      if (!view.live.has(session.tmuxSessionId)) {
+      const identityLost = session.serverIdentity !== undefined
+        && view.serverIdentity !== undefined
+        && session.serverIdentity !== view.serverIdentity;
+      if (identityLost || !view.live.has(session.tmuxSessionId)) {
         return fail("invalid_target", `Subagent session ${sessionId}'s tmux target no longer exists.`);
       }
     } catch (error) {
       return fail(codeOf(error), `Could not verify the subagent session target: ${errorMessage(error)}`);
     }
+
+    const preflight = await this.adapter.preflight(input);
+    if (!preflight.ok) return { ok: false, code: preflight.code, error: preflight.error, sessionId };
 
     let run: SubagentRunRecord;
     try {
@@ -290,6 +347,279 @@ export class SubagentController {
 
     const name = sessionName(input.name, sessionId, this.adapter.sessionNamePrefix ?? `${this.adapter.agent}-subagent`);
     return this.launchSessionTurn(run, session.tmuxSessionId, session.serverIdentity, input, owner, cwd, ancestors, preflight.env, name, signal);
+  }
+
+  /**
+   * Provisions a reusable logical session and its dedicated tmux execution
+   * boundary without starting a turn. `create` and `run` are separate so a caller
+   * can create a session once and then run several sequential turns. Only
+   * multi-turn (`host-window`) ledgers support this.
+   */
+  async createSession(input: SubagentTurnOptions & { agent: SubagentAgent }, owner: string, signal?: AbortSignal): Promise<SubagentCreateResult> {
+    if (this.ledger.kind !== "session" || this.ledger.tmuxStrategy !== "host-window" || !this.ledger.createSession || !this.ledger.bindSession || !this.ledger.getSession) {
+      return fail("invalid_option", "This agent does not support reusable sessions.");
+    }
+    if (typeof owner !== "string" || !owner) return fail("invalid_option", "A non-empty parent Pi session id is required.");
+    let cwd: string;
+    try {
+      cwd = await validateCwd(input?.cwd);
+    } catch (error) {
+      return fail(codeOf(error), errorMessage(error));
+    }
+    if (input.name !== undefined) {
+      const nameError = validateSubagentName(input.name);
+      if (nameError) return fail("invalid_option", nameError);
+    }
+    const optionsError = this.adapter.validateOptions?.(input);
+    if (optionsError) return fail("invalid_option", optionsError);
+    const ancestors = this.lineage();
+    if (ancestors.length > this.maxDepth) {
+      return fail("invalid_option", `Refusing to delegate: the subagent chain already has ${ancestors.length} jobs (max ${this.maxDepth}).`);
+    }
+
+    let created: SubagentSessionInfo;
+    try {
+      created = await this.ledger.createSession({ agent: input.agent ?? this.adapter.agent, cwd, owner });
+    } catch (error) {
+      return fail(codeOf(error), errorMessage(error));
+    }
+
+    const preflight = await this.adapter.preflight(input);
+    if (!preflight.ok) {
+      await this.ledger.stopSession?.(created.sessionId, owner).catch(() => undefined);
+      return { ok: false, code: preflight.code, error: preflight.error, sessionId: created.sessionId };
+    }
+
+    let parentSessionId: string | null;
+    try {
+      parentSessionId = input.parent ? (await this.targets.session(input.parent, signal)).id : await detectParentSession(this.tmux, this.env, signal);
+    } catch (error) {
+      await this.ledger.stopSession?.(created.sessionId, owner).catch(() => undefined);
+      return { ok: false, code: codeOf(error), error: `Could not resolve the parent tmux session: ${errorMessage(error)}`, sessionId: created.sessionId };
+    }
+
+    const name = sessionName(input.name, created.sessionId, this.adapter.sessionNamePrefix ?? `${this.adapter.agent}-subagent`);
+    let tmuxSessionId: string;
+    try {
+      [tmuxSessionId] = await this.createInertSession(name, cwd, signal);
+    } catch (error) {
+      await this.ledger.stopSession?.(created.sessionId, owner).catch(() => undefined);
+      return { ok: false, code: codeOf(error), error: `Could not create the subagent tmux session: ${errorMessage(error)}`, sessionId: created.sessionId, cleanedUp: true };
+    }
+
+    const serverIdentity = await this.serverIdentity();
+    if (!serverIdentity) {
+      const cleanedUp = await this.cleanupSession(tmuxSessionId, signal);
+      await this.ledger.stopSession?.(created.sessionId, owner).catch(() => undefined);
+      return {
+        ok: false, code: "unavailable",
+        error: "Could not determine the tmux server identity; refusing to create a subagent session that close could not verify. Check that the tmux server is reachable.",
+        sessionId: created.sessionId, cleanedUp,
+      };
+    }
+
+    await this.recordProvenance(tmuxSessionId, parentSessionId, name, cwd, owner, serverIdentity);
+
+    try {
+      await this.ledger.bindSession(created.sessionId, { tmuxSessionId, serverIdentity }, owner);
+      await this.ledger.transitionSession?.(created.sessionId, "idle", owner);
+    } catch (error) {
+      const cleanedUp = await this.cleanupSession(tmuxSessionId, signal);
+      await this.ledger.stopSession?.(created.sessionId, owner).catch(() => undefined);
+      const message = `Could not bind the subagent session to its tmux target: ${errorMessage(error)}`;
+      return { ok: false, code: codeOf(error), error: message, sessionId: created.sessionId, cleanedUp };
+    }
+
+    const bound = (await this.ledger.getSession(created.sessionId)) ?? created;
+    return {
+      ok: true,
+      sessionId: created.sessionId,
+      agent: bound.agent,
+      status: bound.status,
+      tmuxSessionId,
+      name,
+      cwd,
+      owner,
+      serverIdentity,
+    };
+  }
+
+  /**
+   * Returns durable status for one logical session and (optionally) one turn.
+   * When the tmux server is reachable, a vanished or re-identified target is
+   * reconciled to `lost` through the same owner-scoped path as `status`, so pane
+   * output is never used to infer lifecycle state.
+   */
+  async statusSession(sessionId: string, owner: string, options: { turnId?: string } = {}, signal?: AbortSignal): Promise<SubagentSessionStatusResult> {
+    if (!this.ledger.getSession || !this.ledger.listTurns) return fail("invalid_option", "This agent does not support reusable sessions.");
+    let session: SubagentSessionInfo | undefined;
+    try {
+      session = await this.ledger.getSession(sessionId);
+    } catch (error) {
+      return fail(codeOf(error), errorMessage(error), { sessionId });
+    }
+    if (!session) return fail("invalid_target", `Unknown subagent session ${JSON.stringify(sessionId)}.`, { sessionId });
+    if (session.owner !== owner) return fail("invalid_target", `Subagent session ${sessionId} belongs to another Pi conversation; refusing to control it.`, { sessionId });
+
+    let reconciled = false;
+    let tmuxUnavailable = false;
+    if (!isTerminalSessionStatus(session.status)) {
+      try {
+        const view = await this.targets.liveTargets(signal);
+        await this.ledger.reconcileRuns(view, { owner });
+        const refreshed = await this.ledger.getSession(sessionId);
+        if (refreshed) {
+          reconciled = refreshed.status !== session.status;
+          session = refreshed;
+        }
+      } catch {
+        tmuxUnavailable = true;
+      }
+    }
+
+    const turns = await this.ledger.listTurns(sessionId);
+    const active = turns.find((turn) => !isTerminalRunStatus(turn.status));
+    let turn: SubagentRunRecord | undefined;
+    if (options.turnId !== undefined) {
+      turn = turns.find((item) => item.runId === options.turnId);
+      if (!turn) return fail("invalid_target", `Unknown subagent turn ${JSON.stringify(options.turnId)} in session ${sessionId}.`, { sessionId });
+    } else {
+      turn = active ?? turns.at(-1);
+    }
+    return {
+      ok: true,
+      session,
+      turns,
+      ...(turn ? { turn } : {}),
+      ...(active ? { activeTurnId: active.runId } : {}),
+      reconciled,
+      ...(tmuxUnavailable ? { tmuxUnavailable: true } : {}),
+    };
+  }
+
+  /**
+   * Cancels the active turn of a logical session (or one explicitly named turn)
+   * without terminating the session. The turn's own pane/window is stopped only
+   * when the exact pane is verified inside the exact recorded session on the exact
+   * recorded tmux server; otherwise the turn is still cancelled but no target is
+   * killed (fail closed). The session stays usable for another turn.
+   */
+  async cancelTurn(sessionId: string, owner: string, options: { turnId?: string } = {}, signal?: AbortSignal): Promise<SubagentCancelTurnResult> {
+    if (!this.ledger.getSession || !this.ledger.listTurns || !this.ledger.cancelTurn) return fail("invalid_option", "This agent does not support reusable sessions.");
+    const session = await this.ledger.getSession(sessionId).catch(() => undefined);
+    if (!session) return fail("invalid_target", `Unknown subagent session ${JSON.stringify(sessionId)}.`, { sessionId });
+    if (session.owner !== owner) return fail("invalid_target", `Subagent session ${sessionId} belongs to another Pi conversation; refusing to control it.`, { sessionId });
+
+    const turns = await this.ledger.listTurns(sessionId);
+    let turn: SubagentRunRecord | undefined;
+    if (options.turnId !== undefined) {
+      turn = turns.find((item) => item.runId === options.turnId);
+      if (!turn) return fail("invalid_target", `Unknown subagent turn ${JSON.stringify(options.turnId)} in session ${sessionId}.`, { sessionId });
+    } else {
+      turn = turns.find((item) => !isTerminalRunStatus(item.status));
+    }
+    if (!turn) {
+      return { ok: true, sessionId, status: "cancelled", alreadyTerminal: true, targetRemoved: false, reason: "No active turn to cancel." };
+    }
+    if (isTerminalRunStatus(turn.status)) {
+      return { ok: true, sessionId, turnId: turn.runId, status: turn.status, alreadyTerminal: true, targetRemoved: false, reason: `Turn is already ${turn.status}.` };
+    }
+
+    const cancelled = await this.ledger.cancelTurn(turn.runId, {}, owner);
+    const targetRemoved = await this.killVerifiedTurnPane(session, turn, signal);
+    return {
+      ok: true,
+      sessionId,
+      turnId: turn.runId,
+      status: cancelled.status,
+      alreadyTerminal: false,
+      targetRemoved,
+      reason: targetRemoved
+        ? "Cancelled the turn and removed its verified pane."
+        : "Cancelled the turn; its pane was not positively verified and was left untouched.",
+    };
+  }
+
+  /**
+   * Stops a logical session and tears down only its verified tmux session. Any
+   * active turn is cancelled first. The tmux session is killed only when the
+   * recorded server identity still matches and the stable session ID is still
+   * live; otherwise the session is marked `stopped` but nothing is killed.
+   */
+  async closeSession(sessionId: string, owner: string, signal?: AbortSignal): Promise<SubagentCloseResult> {
+    if (!this.ledger.getSession || !this.ledger.stopSession || !this.ledger.listTurns) return fail("invalid_option", "This agent does not support reusable sessions.");
+    const session = await this.ledger.getSession(sessionId).catch(() => undefined);
+    if (!session) return fail("invalid_target", `Unknown subagent session ${JSON.stringify(sessionId)}.`, { sessionId });
+    if (session.owner !== owner) return fail("invalid_target", `Subagent session ${sessionId} belongs to another Pi conversation; refusing to control it.`, { sessionId });
+
+    if (isTerminalSessionStatus(session.status)) {
+      return { ok: true, sessionId, status: session.status, alreadyClosed: true, targetRemoved: false, reason: `Session is already ${session.status}.` };
+    }
+
+    // Cancel whatever turn is active so the session can enter a terminal status.
+    const turns = await this.ledger.listTurns(sessionId);
+    const active = turns.find((turn) => !isTerminalRunStatus(turn.status));
+    if (active) {
+      await this.ledger.cancelTurn?.(active.runId, { error: "Session closed by its owner." }, owner).catch(() => undefined);
+    }
+
+    await this.ledger.stopSession(sessionId, owner);
+    const targetRemoved = await this.killVerifiedSession(session, signal);
+    return {
+      ok: true,
+      sessionId,
+      status: "stopped",
+      alreadyClosed: false,
+      targetRemoved,
+      reason: targetRemoved
+        ? "Stopped the session and killed its verified tmux session."
+        : "Stopped the session; its tmux session was not positively verified and was left untouched.",
+    };
+  }
+
+  /** Cancels one run's verified pane only, leaving a session-ledger target alive. */
+  private async killVerifiedTurnPane(session: SubagentSessionInfo, turn: SubagentRunRecord, signal?: AbortSignal): Promise<boolean> {
+    if (turn.tmuxPaneId === null || turn.tmuxSessionId === null || session.tmuxSessionId !== turn.tmuxSessionId) return false;
+    let view: LiveTargets;
+    let panes: PaneTarget[];
+    try {
+      view = await this.targets.liveTargets(signal);
+      panes = await this.targets.panes(signal);
+    } catch {
+      return false;
+    }
+    if (!this.sameServer(session.serverIdentity, view.serverIdentity)) return false;
+    const pane = panes.find((item) => item.id === turn.tmuxPaneId);
+    if (!pane || pane.sessionId !== turn.tmuxSessionId) return false;
+    try {
+      await this.tmux.run(["kill-pane", "-t", turn.tmuxPaneId], { signal });
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  /** Kills the whole session target when it is positively verified, else nothing. */
+  private async killVerifiedSession(session: SubagentSessionInfo, signal?: AbortSignal): Promise<boolean> {
+    if (session.tmuxSessionId === null) return false;
+    let view: LiveTargets;
+    try {
+      view = await this.targets.liveTargets(signal);
+    } catch {
+      return false;
+    }
+    if (!this.sameServer(session.serverIdentity, view.serverIdentity) || !view.live.has(session.tmuxSessionId)) return false;
+    try {
+      await this.tmux.run(["kill-session", "-t", session.tmuxSessionId], { signal });
+      await this.registry.forget("session", session.tmuxSessionId).catch(() => 0);
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  private sameServer(recorded: string | undefined, live: string | undefined): boolean {
+    return recorded !== undefined && live !== undefined && recorded === live;
   }
 
   /**
@@ -383,14 +713,25 @@ export class SubagentController {
     | { ok: true; cwd: string; ancestors: string[] }
     | { ok: false; failure: SubagentFailure }
   > {
-    if (typeof owner !== "string" || !owner) {
-      return { ok: false, failure: fail("invalid_option", "A non-empty parent Pi session id is required.") };
-    }
     let cwd: string;
     try {
       cwd = await validateCwd(input?.cwd);
     } catch (error) {
       return { ok: false, failure: fail(codeOf(error), errorMessage(error)) };
+    }
+    const common = this.validateCommon(input, owner);
+    if (!common.ok) return common;
+    return { ok: true, cwd, ancestors: common.ancestors };
+  }
+
+  /**
+   * Validates the agent-neutral turn inputs that are independent of a working
+   * directory. Used by `runTurn`, where the cwd comes from the durable session
+   * rather than from the caller.
+   */
+  private validateCommon(input: SubagentTurnOptions, owner: string): { ok: true; ancestors: string[] } | { ok: false; failure: SubagentFailure } {
+    if (typeof owner !== "string" || !owner) {
+      return { ok: false, failure: fail("invalid_option", "A non-empty parent Pi session id is required.") };
     }
     const taskError = validateTask(input?.task);
     if (taskError) return { ok: false, failure: fail("invalid_option", taskError) };
@@ -404,7 +745,7 @@ export class SubagentController {
     if (ancestors.length > this.maxDepth) {
       return { ok: false, failure: fail("invalid_option", `Refusing to delegate: the subagent chain already has ${ancestors.length} jobs (max ${this.maxDepth}).`) };
     }
-    return { ok: true, cwd, ancestors };
+    return { ok: true, ancestors };
   }
 
   private lineage(): string[] {
@@ -585,6 +926,7 @@ export class SubagentController {
         statePath: this.ledger.file,
         runId: run.runId,
         sessionId: run.sessionId,
+        ledgerKind: this.ledger.kind,
         turnIndex: run.turnIndex ?? 1,
         ancestors,
         preflight: preflightEnv,

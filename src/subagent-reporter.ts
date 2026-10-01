@@ -45,6 +45,15 @@ export const CHILD_REPORTER_ENV = {
    * is how a nested delegation back into the same job is rejected.
    */
   ancestors: "PI_TMUX_SUBAGENT_ANCESTORS",
+  /**
+   * Optional. `"session"` when the child reports into the generalized
+   * session/turn registry instead of the one-shot job registry. Absent means the
+   * legacy job contract. In session mode `session` and `turn` are required and
+   * `jobId`/`state` name the logical turn and session registry file.
+   */
+  mode: "PI_TMUX_CHILD_REPORTER_MODE",
+  /** Session mode only. The logical `SubagentSessionV1.sessionId` this turn belongs to. */
+  session: "PI_TMUX_SUBAGENT_SESSION_ID",
 } as const;
 
 export const COMPLETION_VERSION = 1 as const;
