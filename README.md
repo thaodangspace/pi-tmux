@@ -80,7 +80,7 @@ Launch contract: the parent creates and binds the job, transitions it `created -
 - On `agent_settled` it derives the outcome from Pi's structured lifecycle data (`agent_before_settle`/`turn_end` outcome; `error`/`aborted` become `failed`, everything else `completed`), writes a bounded machine-readable payload, and moves `running -> completed|failed`. No pane text, prompts, or "done" strings are ever used.
 - It never creates jobs, starts children, notifies the parent, runs GitHub/workflow logic, or kills its own tmux session.
 
-The payload is `PiSubagentCompletionV1` at `$XDG_STATE_HOME/pi-tmux/subagent-reports/<jobId>.json` next to the registry file (owner-only `0600`, fsynced, atomic rename), and its path is stored in the job's `resultPath`:
+The payload is `PiSubagentCompletionV1` at `$XDG_STATE_HOME/pi-tmux/subagent-reports/<jobId>.<unique>.json` next to the registry file (owner-only `0600`, fsynced, atomic rename), and the job's `resultPath` names exactly the winning file. Each attempt writes a unique immutable filename, so a duplicate or concurrent reporter, or a retry, can never overwrite another attempt's payload; the registry remains the arbiter of which payload wins, and losing payloads are removed best-effort:
 
 ```ts
 interface PiSubagentCompletionV1 {
@@ -105,6 +105,7 @@ The summary is truncated from the final assistant message and the error is trunc
 | Job missing, unbound, still `created`, parent mismatch, self-parent, ancestor cycle, wrong pane | `session_start` fails visibly without touching the job. |
 | Pi exits before `agent_settled` | Job stays `running`; the parent marks it `lost` with `reconcile()` against a live tmux view. No output scraping. |
 | `agent_settled` fires more than once | The reporter settles once; the registry also treats a same-status terminal transition as a no-op. |
+| Duplicate/concurrent reporter or retry | Each attempt writes a unique immutable payload; the registry's `resultPath` names the winner and losing payloads are discarded, so a terminal `resultPath`'s contents are never overwritten. |
 | Parent cancelled or another terminal write raced first | The reporter sees the terminal status and leaves it unchanged; terminal outcomes are immutable. |
 | Completion payload write fails | Fail closed: the job is left `running` (parent-recoverable) instead of claiming a terminal outcome the parent cannot read. |
 | Registry terminal transition fails | Fail closed: the job is left `running`; an already-written payload is orphaned but bounded and safely rewritten on retry. |

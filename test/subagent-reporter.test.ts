@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
+import { mkdtemp, readFile, readdir, rm, stat, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
@@ -305,6 +305,57 @@ test("only the requested job changes; unrelated jobs are untouched", async () =>
 
     assert.equal((await harness.registry.get(target))!.status, "completed");
     assert.deepEqual(await harness.registry.get(unrelated), unrelatedBefore);
+  });
+});
+
+test("a second reporter never overwrites the winning completion payload", async () => {
+  await withHarness(async (harness) => {
+    const jobId = await makeJob(harness.registry, { status: "starting" });
+    const first = reporterFor(harness, jobId);
+    const second = reporterFor(harness, jobId);
+    await first.attach({ childSessionId: "child-a" });
+    await second.attach({ childSessionId: "child-b" }); // same job, idempotent while running
+
+    first.observeOutcome("completed");
+    const winner = await first.settle();
+    assert.equal(winner.status, "completed");
+    const winningPath = winner.resultPath!;
+    const originalBytes = await readFile(winningPath, "utf8");
+
+    // A duplicate reporter with a different outcome must not touch the winner.
+    second.observeOutcome("error");
+    const loser = await second.settle();
+    assert.equal(loser.status, "ignored");
+    assert.equal(loser.resultPath, winningPath, "the loser surfaces the durable winning path");
+
+    const job = (await harness.registry.get(jobId))!;
+    assert.equal(job.status, "completed");
+    assert.equal(job.resultPath, winningPath);
+    assert.equal(await readFile(winningPath, "utf8"), originalBytes, "the winning payload is byte-for-byte unchanged");
+    assert.equal(JSON.parse(originalBytes).status, "completed");
+    // The loser's orphan payload was cleaned up; only the winner remains.
+    assert.deepEqual(await readdir(path.dirname(winningPath)), [path.basename(winningPath)]);
+  });
+});
+
+test("concurrent duplicate reporters converge on exactly one winning payload", async () => {
+  await withHarness(async (harness) => {
+    const jobId = await makeJob(harness.registry, { status: "starting" });
+    const a = reporterFor(harness, jobId);
+    const b = reporterFor(harness, jobId);
+    await Promise.all([a.attach({ childSessionId: "child-a" }), b.attach({ childSessionId: "child-b" })]);
+    a.observeOutcome("completed");
+    b.observeOutcome("error");
+    const results = await Promise.all([a.settle(), b.settle()]);
+
+    const job = (await harness.registry.get(jobId))!;
+    assert.ok(job.status === "completed" || job.status === "failed");
+    assert.ok(job.resultPath);
+    const payload = JSON.parse(await readFile(job.resultPath!, "utf8"));
+    assert.equal(payload.status, job.status, "the payload the registry points at matches the durable status");
+    assert.equal(payload.jobId, jobId);
+    assert.deepEqual(await readdir(path.dirname(job.resultPath!)), [path.basename(job.resultPath!)], "exactly the winning payload remains");
+    for (const result of results) assert.equal(result.resultPath, job.resultPath, "every reporter reports the winning path");
   });
 });
 

@@ -403,8 +403,9 @@ export class ChildReporter {
       throw new TmuxError("Cannot settle before the child reporter attaches to its job.", "invalid_option");
     }
     if (this.passive) {
+      const latest = await registry.get(metadata.jobId).catch(() => undefined);
       this.settled = true;
-      this.settleResult = { status: "ignored", reason: "job-already-terminal" };
+      this.settleResult = { status: "ignored", reason: "job-already-terminal", ...(latest?.resultPath ? { resultPath: latest.resultPath } : {}) };
       return this.settleResult;
     }
 
@@ -415,7 +416,7 @@ export class ChildReporter {
     if (isTerminalStatus(current.status)) {
       this.passive = true;
       this.settled = true;
-      this.settleResult = { status: "ignored", reason: "job-already-terminal" };
+      this.settleResult = { status: "ignored", reason: "job-already-terminal", ...(current.resultPath ? { resultPath: current.resultPath } : {}) };
       this.report("info", `Subagent job ${metadata.jobId} became terminal (${current.status}); the child reporter did not overwrite it.`);
       return this.settleResult;
     }
@@ -442,24 +443,48 @@ export class ChildReporter {
       this.fail(`Could not persist the subagent completion payload for job ${metadata.jobId}: ${errorMessage(writeError)}`);
     }
 
+    let updated: SubagentJobV1;
     try {
-      await registry.transition(metadata.jobId, status, { at: finishedAt, ...(resultPath ? { resultPath } : {}), ...(error ? { error } : {}) });
+      updated = await registry.transition(metadata.jobId, status, {
+        at: finishedAt,
+        ...(resultPath ? { resultPath } : {}),
+        ...(error ? { error } : {}),
+      });
     } catch (transitionError) {
       const latest = await registry.get(metadata.jobId).catch(() => undefined);
       if (latest && isTerminalStatus(latest.status)) {
-        // A cancellation/terminal write landed first. Preserve it.
+        // A cancellation/terminal write landed first. Preserve it and drop our
+        // now-unreferenced payload.
+        await this.discardPayload(resultPath, latest.resultPath);
         this.passive = true;
         this.settled = true;
-        this.settleResult = { status: "ignored", reason: "job-already-terminal" };
+        this.settleResult = { status: "ignored", reason: "job-already-terminal", ...(latest.resultPath ? { resultPath: latest.resultPath } : {}) };
         this.report("info", `Subagent job ${metadata.jobId} was already terminal (${latest.status}); completion was not written.`);
         return this.settleResult;
       }
+      await this.discardPayload(resultPath, undefined);
       this.fail(`Could not persist the terminal ${status} state for subagent job ${metadata.jobId}: ${errorMessage(transitionError)}`);
     }
 
+    // `transition` returns the durable post-transition job. When this attempt
+    // won, `resultPath` is ours; when an identical terminal transition already
+    // existed, it is the earlier winner's file, so we never report (or keep) a
+    // payload the registry does not point at.
+    const winningPath = updated.resultPath;
+    await this.discardPayload(resultPath, winningPath);
     this.settled = true;
-    this.settleResult = { status, reason: "settled", ...(resultPath ? { resultPath } : {}) };
+    this.settleResult = {
+      status: updated.status === "failed" ? "failed" : "completed",
+      reason: "settled",
+      ...(winningPath ? { resultPath: winningPath } : {}),
+    };
     return this.settleResult;
+  }
+
+  /** Best-effort removal of an attempt's payload that the registry does not reference. */
+  private async discardPayload(payloadPath: string | undefined, keep: string | undefined): Promise<void> {
+    if (!payloadPath || payloadPath === keep) return;
+    await rm(payloadPath, { force: true }).catch(() => undefined);
   }
 
   private deriveOutcome(): { status: "completed" | "failed"; outcome: ChildReporterOutcome; error?: string } {
@@ -478,7 +503,11 @@ export class ChildReporter {
 
   private async writeCompletion(payload: PiSubagentCompletionV1): Promise<string> {
     const directory = this.completionDir ?? completionDirFor(this.metadata!.statePath);
-    const file = path.join(directory, `${payload.jobId}.json`);
+    // A unique, immutable filename per attempt. Concurrent reporters (or a
+    // duplicate reporter, or a retry after a failed transition) must never
+    // overwrite another attempt's payload: the registry's `resultPath` names
+    // exactly the winning file, and losing attempts are discarded best-effort.
+    const file = path.join(directory, `${payload.jobId}.${randomUUID()}.json`);
     const temporary = `${file}.${process.pid}.${randomUUID()}.tmp`;
     await mkdir(directory, { recursive: true, mode: 0o700 });
     let handle;
