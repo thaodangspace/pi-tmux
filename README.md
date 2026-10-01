@@ -55,6 +55,29 @@ A delegated Pi subagent is tracked as a durable job, separate from tmux target p
 - Retention: active jobs and undelivered terminal jobs are never evicted. Acknowledged terminal history is capped at the 100 most recent (configurable); an absolute hard bound of 500 jobs protects the file, and `create` fails with a clear error at the bound rather than silently dropping live data.
 - The API lives in `src/subagent-jobs.ts` as `SubagentJobRegistry`. Corrupt, unexpected, or unknown-version state is reported and never overwritten.
 
+## Subagent session and turn registry (`SubagentSessionV1` / `SubagentTurnV1`)
+
+Issue #9 generalizes the durable model so a long-lived logical subagent conversation is distinct from the individual executable runs inside it. A **session** survives completed turns and can be resumed through the agent-native conversation id, which is what lets Claude Code, OpenCode, and Pi be first-class durable subagents instead of disposable one-shot runs:
+
+```text
+SubagentSession  (agent, cwd, tmux session boundary, native conversation id)
+  ├─ SubagentTurn #1   (one run in a stable `%N` pane)
+  ├─ SubagentTurn #2
+  └─ ...
+```
+
+- Registry file: `$XDG_STATE_HOME/pi-tmux/subagent-sessions.json` (default `~/.local/state/pi-tmux/subagent-sessions.json`). Set `PI_TMUX_SUBAGENT_SESSIONS` to an absolute path to override it. It uses the same durable `DurableStateFile` primitives as the job registry (`src/durable-state.ts`): `0600` inside a `0700` directory, fsynced atomic rename, and the cross-process owner lock described above.
+- Sessions are `starting | idle | busy | stopped | lost`. Turns are `queued | starting | running | completed | failed | cancelled | lost`. A turn must pass through `starting` and `running`; `starting -> completed` and `queued -> running` are illegal. Terminal turn and session outcomes are immutable.
+- **Only one active turn per session** is allowed for v1; creating another while one is `queued`/`starting`/`running` is rejected. A terminal turn never terminates the session: it returns to `idle` and can run the next turn.
+- The stable tmux session (`$N`, plus `serverIdentity`) is the session's execution boundary; each turn owns a stable pane (`%N`). Binding refuses to point a live turn at a pane another active turn owns, or a live session at a tmux session another active session owns.
+- `agentSessionId` stores the native Claude/OpenCode/Pi conversation id after the first turn so later turns resume the same conversation. It is immutable once set.
+- Completion semantics match the job registry per turn: the first terminal transition assigns a registry-global `completionSeq`; `pendingDeliveries()` lists terminal turns without `notifiedAt`, oldest first; `markNotified()` records the parent's acknowledgement.
+- `reconcile({ live, serverIdentity }, { parentPiSessionId? })` marks active turns and sessions whose target vanished (or whose server identity changed) as `lost`; a session whose own tmux session survives but whose pane vanished returns to `idle`. It is owner-scoped, and a no-op reconcile does not rewrite the file.
+- Parent ownership isolation is enforced on every mutation that names an owner: one Pi conversation cannot transition, bind, or acknowledge another conversation's session or turn.
+- Retention mirrors the job registry: active and undelivered work is never evicted, acknowledged history is capped (100 turns / 100 terminal sessions by default), and absolute hard bounds (1000 turns / 500 sessions) reject creation rather than dropping live data. No prompts, transcripts, or pane output are ever stored.
+- The API lives in `src/subagent-sessions.ts` as `SubagentSessionRegistry`.
+- **Migration / compatibility.** The legacy `SubagentJobV1` file is never destroyed or rewritten. `migrateSubagentJobs({ jobsFile?, sessionsFile? })` reads it and atomically imports every job as one session + one turn, preserving status, timestamps, `completionSeq`, and `notifiedAt`, and recording the original `jobId` as the session's `legacyJobId`. Re-running it is idempotent (already-migrated jobs are skipped), a corrupt legacy file fails closed without writing anything, and migrated pending completions remain recoverable through `pendingDeliveries()`. The live Pi tools still use the job registry unchanged, so the existing public contract is preserved.
+
 ## Pi child completion reporter
 
 For a delegated **Pi** subagent, the child reports its own completion through Pi's `agent_settled` lifecycle event, so the parent never has to scrape pane output or wait for the pane to exit. `agent_end` is not used as the terminal signal because Pi may still continue through retry, compaction, or queued work.
