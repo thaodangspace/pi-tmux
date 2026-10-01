@@ -125,13 +125,14 @@ tmux server
 ```
 
 - `src/turn-runner.ts` is the runner. It re-validates the explicit
-  session/turn/pane/tmux-server binding, transitions the turn
-  `starting -> running`, spawns the adapter-provided executable, then derives the
-  outcome only from the child's exit code and its structured JSON/NDJSON output.
-  It writes a small immutable per-attempt payload to
-  `<state-dir>/subagent-reports/` and applies the terminal turn transition
-  atomically. It never inspects pane text, never serializes the scrollback, and
-  leaves the logical session `idle` for the next turn.
+  session/turn/pane/tmux-server binding, atomically claims launch ownership of
+  the turn, transitions the turn `starting -> running`, spawns the
+  adapter-provided executable, then derives the outcome only from the child's
+  exit code and its structured JSON/NDJSON output. It writes a small immutable
+  per-attempt payload to `<state-dir>/subagent-reports/` and applies the terminal
+  turn transition atomically. It never inspects pane text, never serializes the
+  scrollback, fails closed on truncated output, and leaves the logical session
+  `idle` for the next turn.
 - `src/runner-adapter.ts` (`RunnerAdapter`) is the finite adapter boundary. An
   agent adapter supplies a validated `RunnerSpecV1`:
   `{ version, executable, args, env, output: "json"|"ndjson", prompt:
@@ -145,9 +146,15 @@ tmux server
   interpolated into a shell command. The runner strips its own `PI_TMUX_*`
   variables from the child environment so a nested runner cannot inherit another
   turn's identity.
-- Bounds: stdout/stderr are tail-bounded (256 KiB / 64 KiB), persisted
-  `summary`/`error` are bounded (4 KiB / 2 KiB), and the spec, task, argv, native
-  session id, and environment values all have hard limits.
+- Bounds: stdout/stderr are tail-bounded (256 KiB / 64 KiB) and persisted
+  `summary`/`error` are bounded (4 KiB / 2 KiB); the spec, task, argv, native
+  session id, and environment values all have hard limits. A stdout stream that
+  exceeds its bound is **failed closed** (never parsed as a partial result), and
+  any malformed structured line fails the turn.
+- Launch ownership: the runner atomically claims the turn through the durable
+  `claimTurn` compare-and-set before spawning, so two concurrently launched
+  runners cannot both execute the same turn; the loser exits without spawning a
+  child or writing a payload.
 - Cancellation and duplicates: a terminal turn is immutable. A parent
   cancellation that lands first wins, and a losing or duplicate runner discards
   its own payload and never overwrites the winning `resultPath`.

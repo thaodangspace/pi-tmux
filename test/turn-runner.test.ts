@@ -24,6 +24,8 @@ import {
 
 /** A single fake agent, switched by the `FAKE_MODE` environment value. */
 const AGENT_SCRIPT = `#!/usr/bin/env node
+const fs = require("node:fs");
+if (process.env.FAKE_SPAWN_LOG) { try { fs.appendFileSync(process.env.FAKE_SPAWN_LOG, process.pid + "\\n"); } catch {} }
 const mode = process.env.FAKE_MODE || "success";
 let data = "";
 process.stdin.setEncoding("utf8");
@@ -227,7 +229,7 @@ test("malformed structured output is failed and never treated as completion", as
     const result = await runTurn({ registry, spec: runnerSpec(agent, { env: { FAKE_MODE: "malformed" } }), task: "x", identity: identityFor(bound) });
 
     assert.equal(result.status, "failed");
-    assert.match(String((await readPayload(result.resultPath!)).error), /malformed JSON/);
+    assert.match(String((await readPayload(result.resultPath!)).error), /malformed/);
   });
 });
 
@@ -245,34 +247,49 @@ test("NDJSON output is parsed from the final structured line", async () => {
   });
 });
 
-test("oversized stdout is bounded to a tail that still yields the final result, and stderr never enters the payload", async () => {
+test("a truncated structured stream fails closed even when a valid-looking final line survives", async () => {
   await withTempDir(async (dir) => {
     const registry = new SubagentSessionRegistry(path.join(dir, "sessions.json"));
     const agent = await writeExecutable(dir, "agent.cjs", AGENT_SCRIPT);
+    const bound = await makeBoundTurn(registry, dir);
 
-    const hugeStdout = await makeBoundTurn(registry, dir);
-    const stdoutResult = await runTurn({
+    const result = await runTurn({
       registry,
       spec: runnerSpec(agent, { env: { FAKE_MODE: "huge-stdout" }, output: "ndjson" }),
       task: "x",
-      identity: identityFor(hugeStdout),
+      identity: identityFor(bound),
       maxStdoutBytes: 512,
+      maxErrorBytes: 256,
     });
-    assert.equal(stdoutResult.status, "completed");
-    assert.equal((await readPayload(stdoutResult.resultPath!)).summary, "tail-ok", "the bounded tail keeps the final result");
 
-    const hugeStderr = await makeBoundTurn(registry, dir);
-    const stderrResult = await runTurn({
+    assert.equal(result.status, "failed", "truncation is never treated as success");
+    assert.equal(result.agentSessionId, undefined, "no native id is trusted from an incomplete stream");
+    const payload = await readPayload(result.resultPath!);
+    assert.equal(payload.status, "failed");
+    assert.match(String(payload.error), /truncated/);
+    assert.ok(Buffer.byteLength(String(payload.error), "utf8") <= 256, "the error remains bounded");
+    assert.ok(!String(payload.error).includes("tail-ok"), "the dropped final line is not surfaced as a result");
+  });
+});
+
+test("oversized stderr is bounded and never enters the payload", async () => {
+  await withTempDir(async (dir) => {
+    const registry = new SubagentSessionRegistry(path.join(dir, "sessions.json"));
+    const agent = await writeExecutable(dir, "agent.cjs", AGENT_SCRIPT);
+    const bound = await makeBoundTurn(registry, dir);
+
+    const result = await runTurn({
       registry,
       spec: runnerSpec(agent, { env: { FAKE_MODE: "huge-stderr" } }),
       task: "x",
-      identity: identityFor(hugeStderr),
+      identity: identityFor(bound),
       maxStderrBytes: 256,
     });
-    assert.equal(stderrResult.status, "completed");
-    const stderrPayload = await readPayload(stderrResult.resultPath!);
-    assert.equal(stderrPayload.summary, "ok");
-    assert.ok(!JSON.stringify(stderrPayload).includes("EEEEEEEEEE"), "captured stderr is never persisted");
+
+    assert.equal(result.status, "completed");
+    const payload = await readPayload(result.resultPath!);
+    assert.equal(payload.summary, "ok");
+    assert.ok(!JSON.stringify(payload).includes("EEEEEEEEEE"), "captured stderr is never persisted");
   });
 });
 
@@ -327,25 +344,61 @@ test("a cancellation that lands first wins and is never overwritten by the runne
   });
 });
 
-test("duplicate concurrent runners never overwrite the winning terminal result", async () => {
+test("duplicate concurrent runners cannot both launch a child for the same turn", async () => {
   await withTempDir(async (dir) => {
     const registry = new SubagentSessionRegistry(path.join(dir, "sessions.json"));
     const agent = await writeExecutable(dir, "agent.cjs", AGENT_SCRIPT);
     const bound = await makeBoundTurn(registry, dir);
-    const spec = runnerSpec(agent);
+    const spawnLog = path.join(dir, "spawns.log");
+    const spec = runnerSpec(agent, { env: { FAKE_MODE: "success", FAKE_SPAWN_LOG: spawnLog } });
 
     const [first, second] = await Promise.all([
       runTurn({ registry, spec, task: "x", identity: identityFor(bound) }),
       runTurn({ registry, spec, task: "x", identity: identityFor(bound) }),
     ]);
 
-    assert.equal(first.status, "completed");
-    assert.equal(second.status, "completed");
+    const winners = [first, second].filter((result) => !result.passive);
+    const losers = [first, second].filter((result) => result.passive);
+    assert.equal(winners.length, 1, "exactly one runner owns the launch");
+    assert.equal(winners[0]!.status, "completed");
+    assert.equal(losers.length, 1);
+    assert.ok(losers[0]!.reason, "the losing runner reports why it did not launch");
+
+    const spawns = (await readFile(spawnLog, "utf8")).trim().split("\n").filter(Boolean);
+    assert.equal(spawns.length, 1, "only one child agent process was spawned");
+
     const stored = (await registry.getTurn(bound.turn.turnId))!;
     assert.equal(stored.status, "completed");
-    assert.equal(stored.resultPath, first.resultPath);
-    assert.equal(stored.resultPath, second.resultPath);
+    assert.equal(stored.resultPath, winners[0]!.resultPath);
     assert.deepEqual(await payloadFiles(registry.file), [stored.resultPath], "exactly one immutable payload survives the race");
+  });
+});
+
+test("claimTurn is an atomic launch-ownership compare-and-set", async () => {
+  await withTempDir(async (dir) => {
+    const registry = new SubagentSessionRegistry(path.join(dir, "sessions.json"));
+    const bound = await makeBoundTurn(registry, dir);
+    const owner = { parentPiSessionId: "pi-parent" };
+
+    const first = await registry.claimTurn(bound.turn.turnId, "token-a", owner);
+    assert.equal(first.claimed, true);
+    assert.equal(first.turn.runnerClaim, "token-a");
+
+    const second = await registry.claimTurn(bound.turn.turnId, "token-b", owner);
+    assert.equal(second.claimed, false, "a different token cannot claim a claimed turn");
+    assert.equal(second.turn.runnerClaim, "token-a");
+
+    const same = await registry.claimTurn(bound.turn.turnId, "token-a", owner);
+    assert.equal(same.claimed, true, "the owning token is idempotent");
+    assert.equal((await registry.getTurn(bound.turn.turnId))!.runnerClaim, "token-a");
+
+    await assert.rejects(registry.claimTurn(bound.turn.turnId, "token-c", { parentPiSessionId: "someone-else" }), /another Pi conversation/);
+
+    await registry.transitionTurn(bound.turn.turnId, "running", owner);
+    await registry.transitionTurn(bound.turn.turnId, "completed", owner);
+    const terminal = await registry.claimTurn(bound.turn.turnId, "token-d", owner);
+    assert.equal(terminal.claimed, false);
+    assert.equal(terminal.turn.status, "completed");
   });
 });
 

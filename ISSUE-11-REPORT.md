@@ -64,11 +64,17 @@ tmux server
   (256 KiB / 64 KiB by default); the persisted payload bounds `summary`
   (4 KiB) and `error` (2 KiB) and caps the native session id at 512 bytes. Full
   transcripts and pane contents are never stored or inspected.
-- **Structured completion only.** The outcome is derived from the child's exit
-  code and its parsed JSON/NDJSON output (declarative `parse` dot-paths for
-  `sessionId`/`text`/`error`/`isError`). A malformed/truncated final line, a
-  missing executable, or a spawn error is `failed`; success is never inferred
-  from pane text.
+- **Structured completion only, fail-closed on truncation.** The outcome is
+  derived from the child's exit code and its parsed JSON/NDJSON output
+  (declarative `parse` dot-paths for `sessionId`/`text`/`error`/`isError`). A
+  truncated stdout stream is rejected outright — the tail buffer cannot prove
+  that earlier structured output was not dropped — and any malformed structured
+  line, a missing executable, or a spawn error is `failed`. Success is never
+  inferred from pane text.
+- **Atomic launch ownership.** Before spawning, the runner atomically claims the
+  turn via `SubagentSessionRegistry.claimTurn` (a durable compare-and-set under
+  the registry lock). Two concurrently launched runners cannot both execute the
+  same turn: the loser returns without spawning a child or writing a payload.
 - **Atomic, immutable terminal transition.** The payload is written under a
   unique per-attempt filename, then `transitionTurn` is applied. A race that
   loses to a cancellation or a duplicate runner discards its own payload and
@@ -127,21 +133,23 @@ Run in this worktree after `npm ci`:
 | Command | Exit | Result |
 | --- | --- | --- |
 | `npm run build` (`tsc --noEmit`) | 0 | clean |
-| `npm test` (`tsx --test`) | 0 | 177 tests, 177 pass, 0 fail (149 pre-existing + 28 new) |
+| `npm test` (`tsx --test`) | 0 | 179 tests, 179 pass, 0 fail (149 pre-existing + 30 new) |
 
 Covered by the new tests:
 
 - successful JSON result, durable bounded payload, native-id capture, session
   returns to `idle`;
 - non-zero exit, explicit `is_error`, malformed output, NDJSON final-line parse;
-- oversized stdout (tail still yields the final result) and stderr that never
-  reaches the payload;
+- **truncated stdout fails closed** even when a valid-looking final line
+  survives (regression), and oversized stderr is bounded and never persisted;
 - prompt containing spaces, quotes, newlines, `;`, `$()`, and backticks,
   delivered verbatim on both transports, with a proven no-side-effect check and
   an executable path containing spaces (`shell: false`);
 - runner killed mid-turn, leaving the turn recoverable and reconciling to `lost`;
-- cancellation races and duplicate concurrent runners never overwriting the
-  terminal result (exactly one payload survives);
+- cancellation races; **duplicate concurrent runners: exactly one claims launch
+  and spawns a child** (verified with a per-spawn log), the other returns
+  passively; `claimTurn` compare-and-set semantics (idempotent token, owner
+  isolation, terminal refusal);
 - wrong pane/session/owner/server metadata failing closed without mutation;
 - agent session id captured and resumed by a second turn on the same session;
 - tmux server restart / stable-ID reuse protection (identity mismatch to `lost`);
@@ -154,9 +162,9 @@ Covered by the new tests:
 - **Decision — config-driven, not agent-specific.** The runner contains no
   Claude/OpenCode flags; adapters supply a validated `RunnerSpecV1`. This keeps
   the runner honest and lets future adapters ship as data.
-- **Decision — fail closed on ambiguous output.** A malformed final output line
-  fails the turn rather than guessing; a stray malformed earlier line is
-  tolerated and noted.
+- **Decision — fail closed on ambiguous output.** A truncated stdout stream
+  fails the turn outright, and any malformed structured line fails the turn
+  rather than guessing.
 - **Limitation — no shipped Claude Code / OpenCode adapter or tool.** This adds
   the runner, the adapter boundary, and delivery; a concrete adapter plus a
   parent tool that creates session/turn records for those agents is a follow-up,
@@ -171,6 +179,28 @@ Covered by the new tests:
 - **Limitation — no per-child wall-clock timeout.** A hung agent is bounded by
   parent cancellation (which kills the verified tmux session and thus the runner
   and child) and by reconciliation; there is no independent runner timeout yet.
+- **Limitation — a claim has no automatic reclamation.** Because a runner crash
+  is recovered by reconciliation marking the turn `lost` (terminal), a stale
+  non-terminal claim only matters while the turn is genuinely active; there is no
+  separate claim-lease expiry, and a turn with a live pane is never relaunched.
+
+## Review follow-up
+
+Two review findings were addressed before merge:
+
+1. **Truncated structured output now fails closed.** `parseStructured` no longer
+   ignores truncation; any stdout that exceeded its bound fails the turn with a
+   bounded error and yields no summary or native id. Regression test:
+   `a truncated structured stream fails closed even when a valid-looking final
+   line survives`.
+2. **Atomic launch ownership.** `SubagentSessionRegistry.claimTurn` is a durable
+   compare-and-set (executed under the registry lock) that grants exclusive
+   launch ownership of a turn. The runner claims before spawning; a second
+   concurrently launched runner observes a different token, returns passively,
+   and never spawns a child or writes a payload. Tests:
+   `duplicate concurrent runners cannot both launch a child for the same turn`
+   (a per-spawn log proves exactly one child) and
+   `claimTurn is an atomic launch-ownership compare-and-set`.
 
 ## PR
 

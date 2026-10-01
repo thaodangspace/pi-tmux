@@ -109,6 +109,12 @@ export interface SubagentTurnV1 {
   status: SubagentTurnStatus;
   /** Stable tmux pane ID (`%N`) this turn runs in, or null until bound. */
   tmuxPaneId: string | null;
+  /**
+   * Random token of the runner that atomically claimed exclusive launch
+   * ownership of this turn. Set once by `claimTurn`; a second runner that finds a
+   * different token must not spawn a child for this turn.
+   */
+  runnerClaim?: string;
   createdAt: string;
   startedAt?: string;
   finishedAt?: string;
@@ -209,6 +215,7 @@ const DEFAULT_MAX_SESSIONS = 500;
 const DEFAULT_LOCK_TIMEOUT_MS = 10_000;
 const DEFAULT_LOCK_RETRY_MS = 25;
 const MAX_AGENT_SESSION_ID_BYTES = 512;
+const MAX_RUNNER_CLAIM_BYTES = 512;
 const SESSION_ID = /^\$\d+$/;
 const PANE_ID = /^%\d+$/;
 
@@ -462,6 +469,40 @@ export class SubagentSessionRegistry {
       turn.tmuxPaneId = tmuxPaneId;
       session.updatedAt = at;
       return { ...turn };
+    });
+  }
+
+  /**
+   * Atomically claims exclusive launch ownership of one turn for one runner.
+   *
+   * This is the durable compare-and-set that stops two concurrently launched
+   * runners from both spawning a child agent for the same turn. Only a
+   * non-terminal, bound turn with no claim (or the caller's own claim) is
+   * claimed; a terminal turn or a turn claimed by another token is not. The
+   * claim is assigned while the cross-process registry lock is held, so exactly
+   * one contender can observe `claimed: true`.
+   */
+  async claimTurn(turnId: string, token: string, options: SessionMutationOptions = {}): Promise<{ claimed: boolean; turn: SubagentTurnV1 }> {
+    assertTurnId(turnId);
+    const claim = requireBoundedString(token, "runnerClaim", MAX_RUNNER_CLAIM_BYTES);
+    const at = this.mutationTime(options.at);
+    return this.mutateIfChanged<{ claimed: boolean; turn: SubagentTurnV1 }>((state) => {
+      const turn = findTurn(state, turnId);
+      const session = sessionOfTurn(state, turn);
+      assertOwner(session, options.parentPiSessionId);
+      if (isTerminalTurnStatus(turn.status)) return { value: { claimed: false, turn: { ...turn } }, changed: false };
+      if (turn.tmuxPaneId === null) {
+        throw new TmuxError(`Turn ${turnId} must be bound to a stable tmux pane before it can be claimed.`, "invalid_option");
+      }
+      if (turn.runnerClaim !== undefined && turn.runnerClaim !== claim) {
+        return { value: { claimed: false, turn: { ...turn } }, changed: false };
+      }
+      if (turn.runnerClaim === undefined) {
+        turn.runnerClaim = claim;
+        session.updatedAt = at;
+        return { value: { claimed: true, turn: { ...turn } }, changed: true };
+      }
+      return { value: { claimed: true, turn: { ...turn } }, changed: false };
     });
   }
 
@@ -936,6 +977,7 @@ function isTurn(value: unknown): value is SubagentTurnV1 {
   if (typeof turn.sessionId !== "string" || !turn.sessionId) return false;
   if (typeof turn.status !== "string" || !SUBAGENT_TURN_STATUSES.includes(turn.status as SubagentTurnStatus)) return false;
   if (!(typeof turn.tmuxPaneId === "string" || turn.tmuxPaneId === null)) return false;
+  if (turn.runnerClaim !== undefined && (typeof turn.runnerClaim !== "string" || !turn.runnerClaim || Buffer.byteLength(turn.runnerClaim, "utf8") > MAX_RUNNER_CLAIM_BYTES)) return false;
   if (typeof turn.createdAt !== "string" || !Number.isFinite(Date.parse(turn.createdAt))) return false;
   for (const field of ["startedAt", "finishedAt", "notifiedAt"] as const) {
     const timestamp = turn[field];

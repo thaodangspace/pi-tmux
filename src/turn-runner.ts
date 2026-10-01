@@ -170,6 +170,8 @@ export interface TurnRunnerResult {
   status: SubagentTurnStatus;
   /** True when a racing terminal write (for example a cancellation) won. */
   passive: boolean;
+  /** Set when the runner did not launch or record for a reason other than winning. */
+  reason?: string;
   sessionId: string;
   turnId: string;
   agentSessionId?: string;
@@ -327,7 +329,19 @@ export async function runTurn(options: TurnRunnerOptions): Promise<TurnRunnerRes
     // A parent cancellation or an earlier runner already settled this turn. Do
     // not spawn and do not overwrite the terminal outcome.
     report("info", `Turn ${turn.turnId} is already terminal (${turn.status}); the runner will not rewrite it.`);
-    return terminalResult(turn, true);
+    return passiveResult(turn, "turn is already terminal");
+  }
+
+  // Durable compare-and-set for launch ownership: exactly one runner may spawn a
+  // child for this turn, even if two are launched concurrently.
+  const claim = await registry.claimTurn(turn.turnId, randomUUID(), ownerOptions);
+  if (isTerminalTurnStatus(claim.turn.status)) {
+    report("info", `Turn ${turn.turnId} became terminal (${claim.turn.status}) before launch; the runner will not rewrite it.`);
+    return passiveResult(claim.turn, "turn became terminal before launch");
+  }
+  if (!claim.claimed) {
+    report("warning", `Turn ${turn.turnId} is already owned by another runner; refusing to launch a second child.`);
+    return passiveResult(claim.turn, "another runner owns this turn's launch");
   }
 
   if (!(await isExecutableFile(spec.executable))) {
@@ -357,7 +371,7 @@ export async function runTurn(options: TurnRunnerOptions): Promise<TurnRunnerRes
     signal: options.signal,
   });
 
-  const outcome = deriveOutcome(collected, spec, maxSummaryBytes, maxErrorBytes);
+  const outcome = deriveOutcome(collected, spec, maxSummaryBytes, maxErrorBytes, maxStdoutBytes);
   report("info", `Turn ${turn.turnId} (${session.agent}) ${outcome.status}${outcome.exitCode !== undefined ? ` (exit ${outcome.exitCode})` : ""}.`);
 
   return await finishTurn(registry, session, turn, identity, {
@@ -384,7 +398,7 @@ async function advanceToRunning(
       await registry.transitionTurn(turnId, target, ownerOptions);
     } catch (error) {
       const latest = await registry.getTurn(turnId).catch(() => undefined);
-      if (latest && isTerminalTurnStatus(latest.status)) return terminalResult(latest, true);
+      if (latest && isTerminalTurnStatus(latest.status)) return passiveResult(latest, "turn became terminal before launch");
       // A concurrent runner already advanced to `target` (or to `running` when
       // this runner tried `starting`); that is not an error.
       if (latest && (latest.status === target || (target === "starting" && latest.status === "running"))) continue;
@@ -486,20 +500,35 @@ interface DerivedOutcome {
   error?: string;
 }
 
-function deriveOutcome(run: CollectedRun, spec: RunnerSpecV1, maxSummaryBytes: number, maxErrorBytes: number): DerivedOutcome {
+function deriveOutcome(run: CollectedRun, spec: RunnerSpecV1, maxSummaryBytes: number, maxErrorBytes: number, maxStdoutBytes: number): DerivedOutcome {
   const exitCode = run.code ?? undefined;
-  const parsed = parseStructured(run.stdout, spec.output, run.stdoutTruncated);
-  const objects = parsed.objects;
-
-  const agentSessionId = boundedAgentSessionId(firstString(objects, spec.parse?.sessionId));
-  const base = { ...(exitCode !== undefined ? { exitCode } : {}), ...(agentSessionId !== undefined ? { agentSessionId } : {}) };
+  const withExit = exitCode !== undefined ? { exitCode } : {};
 
   if (run.spawnError) {
-    return { ...base, status: "failed", error: truncate(`Could not start ${spec.executable}: ${run.spawnError}`, maxErrorBytes) };
+    return { ...withExit, status: "failed", error: truncate(`Could not start ${spec.executable}: ${run.spawnError}`, maxErrorBytes) };
   }
   if (run.aborted) {
-    return { ...base, status: "failed", error: "The runner was cancelled before the turn completed." };
+    return { ...withExit, status: "failed", error: "The runner was cancelled before the turn completed." };
   }
+  // Fail closed on any truncation: the tail buffer keeps the last bytes, so a
+  // valid-looking final line cannot be distinguished from a stream whose earlier
+  // structured output was silently dropped. Never infer completion from it.
+  if (run.stdoutTruncated) {
+    return {
+      ...withExit,
+      status: "failed",
+      error: truncate(
+        `The agent's structured stdout exceeded the ${maxStdoutBytes}-byte limit and was truncated; refusing to infer completion from an incomplete stream.`,
+        maxErrorBytes,
+      ),
+    };
+  }
+
+  const parsed = parseStructured(run.stdout, spec.output);
+  const objects = parsed.objects;
+  const agentSessionId = boundedAgentSessionId(firstString(objects, spec.parse?.sessionId));
+  const base = { ...withExit, ...(agentSessionId !== undefined ? { agentSessionId } : {}) };
+
   if (!parsed.ok) {
     return { ...base, status: "failed", error: truncate(parsed.error, maxErrorBytes) };
   }
@@ -508,9 +537,8 @@ function deriveOutcome(run: CollectedRun, spec: RunnerSpecV1, maxSummaryBytes: n
   const fieldError = lastString(objects, spec.parse?.error);
   const text = lastString(objects, spec.parse?.text);
 
-  if (exitCode !== 0 || isError === true || parsed.warning) {
-    const reason = parsed.warning
-      ?? fieldError
+  if (exitCode !== 0 || isError === true) {
+    const reason = fieldError
       ?? (exitCode !== undefined && exitCode !== 0 ? `The agent exited with code ${exitCode}.` : "The agent reported an error.");
     return { ...base, status: "failed", error: truncate(reason, maxErrorBytes) };
   }
@@ -584,26 +612,38 @@ async function finishTurn(
     });
     const winningPath = updated.resultPath;
     await discardPayload(resultPath, winningPath);
-    return terminalResult(updated, false, outcome.agentSessionId);
+    return terminalResult(updated, outcome.agentSessionId);
   } catch (transitionError) {
     const latest = await registry.getTurn(turn.turnId).catch(() => undefined);
     if (latest && isTerminalTurnStatus(latest.status)) {
       await discardPayload(resultPath, latest.resultPath);
-      return terminalResult(latest, true);
+      return passiveResult(latest, "a racing terminal write won");
     }
     await discardPayload(resultPath, undefined);
     throw transitionError;
   }
 }
 
-function terminalResult(turn: SubagentTurnV1, passive: boolean, agentSessionId?: string): TurnRunnerResult {
+function terminalResult(turn: SubagentTurnV1, agentSessionId?: string): TurnRunnerResult {
   return {
     status: turn.status,
-    passive,
+    passive: false,
     sessionId: turn.sessionId,
     turnId: turn.turnId,
     ...(agentSessionId ? { agentSessionId } : {}),
     ...(turn.exitCode !== undefined ? { exitCode: turn.exitCode } : {}),
+    ...(turn.resultPath ? { resultPath: turn.resultPath } : {}),
+    ...(turn.error ? { error: turn.error } : {}),
+  };
+}
+
+function passiveResult(turn: SubagentTurnV1, reason: string): TurnRunnerResult {
+  return {
+    status: turn.status,
+    passive: true,
+    reason,
+    sessionId: turn.sessionId,
+    turnId: turn.turnId,
     ...(turn.resultPath ? { resultPath: turn.resultPath } : {}),
     ...(turn.error ? { error: turn.error } : {}),
   };
@@ -684,11 +724,9 @@ interface ParsedStructured {
   ok: boolean;
   objects: unknown[];
   error: string;
-  /** A non-fatal parse note (for example a malformed line before a valid result). */
-  warning?: string;
 }
 
-function parseStructured(stdout: string, output: "json" | "ndjson", _truncated: boolean): ParsedStructured {
+function parseStructured(stdout: string, output: "json" | "ndjson"): ParsedStructured {
   const text = stdout.trim();
   if (!text) return { ok: false, objects: [], error: "The agent produced no structured output; completion cannot be established." };
   if (output === "json") {
@@ -702,27 +740,20 @@ function parseStructured(stdout: string, output: "json" | "ndjson", _truncated: 
 }
 
 function parseLines(text: string, emptyError: string): ParsedStructured {
-  const lines = text.split(/\r?\n/);
   const objects: unknown[] = [];
-  let lastLineFailed = false;
-  let malformedBefore = false;
-  for (const raw of lines) {
+  for (const raw of text.split(/\r?\n/)) {
     const line = raw.trim();
     if (!line) continue;
-    // A truncated tail can begin mid-line; a line that does not parse before a
-    // valid one is ignored (malformedBefore stays false), while a malformed
-    // final line fails the turn so a partial result is never mistaken for one.
     try {
       objects.push(JSON.parse(line));
-      lastLineFailed = false;
     } catch {
-      lastLineFailed = true;
-      if (objects.length > 0) malformedBefore = true;
+      // A single malformed structured line fails the turn: a partial or
+      // ambiguous stream is never treated as a completed result.
+      return { ok: false, objects, error: "The agent produced a malformed structured output line." };
     }
   }
   if (objects.length === 0) return { ok: false, objects: [], error: emptyError };
-  if (lastLineFailed) return { ok: false, objects, error: "The agent's final structured output line was truncated or malformed." };
-  return { ok: true, objects, error: "", ...(malformedBefore ? { warning: "Some agent output lines were malformed; the last structured result was used." } : {}) };
+  return { ok: true, objects, error: "" };
 }
 
 function extractPath(value: unknown, dotPath: string): unknown {
