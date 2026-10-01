@@ -119,6 +119,9 @@ test("delivers one machine-readable completion event to the owning parent and ac
       status: "completed",
       completionSeq: job.completionSeq,
       finishedAt: job.finishedAt,
+      agent: "pi",
+      sessionId: job.jobId,
+      turnId: job.jobId,
     });
     assert.equal((await h.jobs.get(job.jobId))?.notifiedAt !== undefined, true, "the durable acknowledgement is recorded after delivery");
     assert.equal(delivery.observing, false, "no observation remains once nothing is active or pending");
