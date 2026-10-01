@@ -275,21 +275,54 @@ test("two registry instances sharing a file serialize read-modify-write", async 
   });
 });
 
-test("a lock owned by a dead process or past the stale threshold is reclaimed", async () => {
+test("a lock owned by a dead process is reclaimed exactly once", async () => {
   await withRegistry(async (registry, file) => {
     await mkdir(path.dirname(file), { recursive: true });
-
-    const child = spawn(process.execPath, ["-e", ""]);
-    const deadPid = child.pid!;
-    await once(child, "exit");
+    const deadPid = await deadProcessPid();
     await writeFile(`${file}.lock`, JSON.stringify({ pid: deadPid, token: "dead", acquiredAt: new Date().toISOString() }));
-    assert.ok((await registry.create({ cwd: "/work", parentPiSessionId: null })).jobId, "a dead owner's lock is stolen");
+    assert.ok((await registry.create({ cwd: "/work", parentPiSessionId: null })).jobId, "a dead owner's lock is reclaimed");
     await assert.rejects(() => readFile(`${file}.lock`, "utf8"), /ENOENT/);
+    await assert.rejects(() => readFile(`${file}.lock.break`, "utf8"), /ENOENT/, "the breaker is released");
+  });
+});
 
-    const aged = new SubagentJobRegistry(file, { lockStaleMs: 20 });
-    await writeFile(`${file}.lock`, JSON.stringify({ pid: process.pid, token: "aged", acquiredAt: new Date(0).toISOString() }));
+test("a lock held by a live owner is never stolen, even when old", async () => {
+  await withRegistry(async (registry, file) => {
+    await mkdir(path.dirname(file), { recursive: true });
+    await writeFile(`${file}.lock`, JSON.stringify({ pid: process.pid, token: "live", acquiredAt: new Date(0).toISOString() }));
     await utimes(`${file}.lock`, 0, 0);
-    assert.ok((await aged.create({ cwd: "/work", parentPiSessionId: null })).jobId, "an aged lock is stolen");
+    const bounded = new SubagentJobRegistry(file, { lockTimeoutMs: 150, lockRetryMs: 10 });
+    await assert.rejects(() => bounded.create({ cwd: "/work", parentPiSessionId: null }), /Timed out|lock/);
+    assert.equal(JSON.parse(await readFile(`${file}.lock`, "utf8")).token, "live", "the live owner's lock is untouched");
+    await rm(`${file}.lock`, { force: true });
+    assert.ok((await registry.create({ cwd: "/work", parentPiSessionId: null })).jobId);
+  });
+});
+
+test("a held breaker is respected rather than stolen, so recovery cannot run concurrently", async () => {
+  await withRegistry(async (registry, file) => {
+    await mkdir(path.dirname(file), { recursive: true });
+    const deadPid = await deadProcessPid();
+    // A stale main lock plus a breaker whose owner also died is the ambiguous
+    // case: fail closed instead of risking two concurrent removers.
+    await writeFile(`${file}.lock`, JSON.stringify({ pid: deadPid, token: "dead", acquiredAt: new Date().toISOString() }));
+    await writeFile(`${file}.lock.break`, JSON.stringify({ pid: deadPid, token: "dead-breaker", acquiredAt: new Date().toISOString() }));
+    const bounded = new SubagentJobRegistry(file, { lockTimeoutMs: 150, lockRetryMs: 10 });
+    await assert.rejects(() => bounded.create({ cwd: "/work", parentPiSessionId: null }), /Timed out|lock/);
+    assert.equal(JSON.parse(await readFile(`${file}.lock`, "utf8")).token, "dead", "the stale main lock is left for manual recovery");
+    assert.equal(JSON.parse(await readFile(`${file}.lock.break`, "utf8")).token, "dead-breaker");
+  });
+});
+
+test("concurrent contenders safely break one stale lock without losing updates", async () => {
+  await withRegistry(async (registry, file) => {
+    await mkdir(path.dirname(file), { recursive: true });
+    const deadPid = await deadProcessPid();
+    await writeFile(`${file}.lock`, JSON.stringify({ pid: deadPid, token: "dead", acquiredAt: new Date().toISOString() }));
+    const instances = Array.from({ length: 8 }, () => new SubagentJobRegistry(file, { lockRetryMs: 1 }));
+    const created = await Promise.all(instances.map((instance) => instance.create({ cwd: "/work", parentPiSessionId: null })));
+    assert.equal(new Set(created.map((job) => job.jobId)).size, instances.length);
+    assert.equal((await registry.list()).length, instances.length, "no update was lost while breaking the stale lock");
     await assert.rejects(() => readFile(`${file}.lock`, "utf8"), /ENOENT/);
   });
 });
@@ -308,6 +341,31 @@ test("concurrent processes cannot clobber each other's updates", { skip: tsxAvai
     assert.equal(new Set(jobs.map((job) => job.jobId)).size, jobs.length);
   });
 });
+
+test("concurrent processes safely break one stale lock without losing updates", { skip: tsxAvailable ? false : "tsx is not installed" }, async () => {
+  await withRegistry(async (registry, file) => {
+    await mkdir(path.dirname(file), { recursive: true });
+    const workerPath = path.join(import.meta.dirname, "subagent-job-worker.ts");
+    const workers = 6;
+    const perWorker = 3;
+    let expected = 0;
+    for (let round = 0; round < 2; round++) {
+      const deadPid = await deadProcessPid();
+      await writeFile(`${file}.lock`, JSON.stringify({ pid: deadPid, token: `dead-${round}`, acquiredAt: new Date().toISOString() }));
+      const results = await Promise.all(Array.from({ length: workers }, (_, worker) => runWorker(workerPath, file, round * workers + worker, perWorker)));
+      expected += workers * perWorker;
+      assert.equal(new Set(results.flat()).size, workers * perWorker);
+      assert.equal((await registry.list()).length, expected, `round ${round}: no update was lost while breaking the stale lock across processes`);
+    }
+  });
+});
+
+async function deadProcessPid(): Promise<number> {
+  const child = spawn(process.execPath, ["-e", ""]);
+  const pid = child.pid!;
+  await once(child, "exit");
+  return pid;
+}
 
 function runWorker(workerPath: string, file: string, worker: number, count: number): Promise<string[]> {
   return new Promise((resolve, reject) => {

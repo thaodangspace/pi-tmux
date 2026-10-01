@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { mkdir, open, readFile, rename, rm, stat, writeFile } from "node:fs/promises";
+import { link, mkdir, open, readFile, rename, rm, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import path from "node:path";
 import { TmuxError, errorMessage } from "./tmux.ts";
@@ -124,8 +124,6 @@ export interface SubagentJobRegistryOptions {
   maxJobs?: number;
   /** How long to wait for the cross-process lock before failing (default 10s). */
   lockTimeoutMs?: number;
-  /** A lock older than this is considered abandoned and may be stolen (default 30s). */
-  lockStaleMs?: number;
   /** Delay between lock acquisition attempts (default 25ms). */
   lockRetryMs?: number;
   /** Injectable clock for deterministic tests. */
@@ -135,7 +133,6 @@ export interface SubagentJobRegistryOptions {
 const DEFAULT_MAX_ACKNOWLEDGED = 100;
 const DEFAULT_MAX_JOBS = 500;
 const DEFAULT_LOCK_TIMEOUT_MS = 10_000;
-const DEFAULT_LOCK_STALE_MS = 30_000;
 const DEFAULT_LOCK_RETRY_MS = 25;
 const SESSION_ID = /^\$\d+$/;
 const PANE_ID = /^%\d+$/;
@@ -152,7 +149,6 @@ export class SubagentJobRegistry {
   private readonly maxAcknowledged: number;
   private readonly maxJobs: number;
   private readonly lockTimeoutMs: number;
-  private readonly lockStaleMs: number;
   private readonly lockRetryMs: number;
   private readonly now: () => Date;
 
@@ -161,7 +157,6 @@ export class SubagentJobRegistry {
     this.maxJobs = positiveInteger(options.maxJobs ?? DEFAULT_MAX_JOBS, "maxJobs");
     if (this.maxAcknowledged > this.maxJobs) throw new TmuxError("maxAcknowledged cannot exceed maxJobs.", "invalid_option");
     this.lockTimeoutMs = positiveInteger(options.lockTimeoutMs ?? DEFAULT_LOCK_TIMEOUT_MS, "lockTimeoutMs");
-    this.lockStaleMs = positiveInteger(options.lockStaleMs ?? DEFAULT_LOCK_STALE_MS, "lockStaleMs");
     this.lockRetryMs = positiveInteger(options.lockRetryMs ?? DEFAULT_LOCK_RETRY_MS, "lockRetryMs");
     this.now = options.now ?? (() => new Date());
   }
@@ -441,67 +436,116 @@ export class SubagentJobRegistry {
     const deadline = Date.now() + this.lockTimeoutMs;
     for (;;) {
       this.lockToken = `${process.pid}:${randomUUID()}`;
-      try {
-        await writeFile(lockPath, JSON.stringify({ pid: process.pid, token: this.lockToken, acquiredAt: this.now().toISOString() }), { flag: "wx", mode: 0o600 });
-        return;
-      } catch (error) {
-        if ((error as NodeJS.ErrnoException).code !== "EEXIST") {
-          throw new TmuxError(`Could not lock the subagent job registry at ${this.file}: ${errorMessage(error)}`, "command_failed");
+      if (await this.tryCreateLock(lockPath, this.lockToken)) return;
+      const info = await this.readLockInfo(lockPath);
+      if (info && !isProcessAlive(info.pid)) {
+        // The owner is gone. Recovery is serialized through a separate breaker
+        // lock so two contenders can never remove the lock concurrently.
+        const broke = await this.breakStaleLock(lockPath, info.token);
+        if (!broke) {
+          if (Date.now() >= deadline) throw this.lockTimeoutError(lockPath);
+          await delay(this.lockRetryMs);
         }
+        continue;
       }
-      if (await this.stealStaleLock(lockPath)) continue;
-      if (Date.now() >= deadline) {
-        throw new TmuxError(`Timed out after ${this.lockTimeoutMs}ms waiting for the subagent job registry lock at ${lockPath}. If no other process is writing, remove the lock file and retry.`, "command_failed");
-      }
+      if (Date.now() >= deadline) throw this.lockTimeoutError(lockPath);
       await delay(this.lockRetryMs);
     }
   }
 
-  private async stealStaleLock(lockPath: string): Promise<boolean> {
-    let info;
-    try {
-      info = await stat(lockPath);
-    } catch {
-      return true; // The lock vanished; try to acquire it again immediately.
-    }
-    const age = Date.now() - info.mtimeMs;
-    if (age < this.lockStaleMs && !(await this.lockOwnerDead(lockPath))) return false;
-    // Steal by renaming first so only one contender can ever win.
-    const graveyard = `${lockPath}.stale.${process.pid}.${randomUUID()}`;
-    try {
-      await rename(lockPath, graveyard);
-    } catch {
-      return false; // Another process stole it first; retry after the delay.
-    }
-    await rm(graveyard, { force: true }).catch(() => undefined);
-    return true;
+  private lockTimeoutError(lockPath: string): TmuxError {
+    return new TmuxError(
+      `Timed out after ${this.lockTimeoutMs}ms waiting for the subagent job registry lock at ${lockPath}. If no other Pi process is writing, remove the lock file and retry.`,
+      "command_failed",
+    );
   }
 
-  private async lockOwnerDead(lockPath: string): Promise<boolean> {
+  /**
+   * Atomically creates a lock file with complete content: the payload is
+   * written to a unique temp file first and then hard-linked into place, so a
+   * crash can never expose an empty or partial lock. `link` fails with EEXIST
+   * when the target exists, which is the mutual-exclusion primitive.
+   */
+  private async tryCreateLock(lockPath: string, token: string): Promise<boolean> {
+    const content = JSON.stringify({ pid: process.pid, token, acquiredAt: this.now().toISOString() });
+    const temporary = `${lockPath}.${process.pid}.${randomUUID()}.tmp`;
     try {
-      const parsed = JSON.parse(await readFile(lockPath, "utf8")) as { pid?: unknown };
-      const pid = parsed.pid;
-      if (!Number.isSafeInteger(pid) || (pid as number) <= 0 || pid === process.pid) return false;
-      try {
-        process.kill(pid as number, 0);
-        return false;
-      } catch (error) {
-        return (error as NodeJS.ErrnoException).code === "ESRCH";
+      await writeFile(temporary, content, { encoding: "utf8", mode: 0o600 });
+      await link(temporary, lockPath);
+      return true;
+    } catch (error) {
+      const code = (error as NodeJS.ErrnoException).code;
+      if (code === "EEXIST") return false;
+      // Filesystems without hard links still get an exclusive create; the only
+      // cost is that a crash could leave partial content, which fails closed.
+      if (code === "EPERM" || code === "ENOSYS" || code === "EOPNOTSUPP" || code === "ENOTSUP") {
+        return this.tryCreateLockExclusive(lockPath, content);
       }
-    } catch {
-      return false; // Unreadable or partial lock: fall back to the age threshold.
+      throw new TmuxError(`Could not lock the subagent job registry at ${this.file}: ${errorMessage(error)}`, "command_failed");
+    } finally {
+      await rm(temporary, { force: true }).catch(() => undefined);
     }
+  }
+
+  private async tryCreateLockExclusive(lockPath: string, content: string): Promise<boolean> {
+    try {
+      await writeFile(lockPath, content, { flag: "wx", mode: 0o600 });
+      return true;
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "EEXIST") return false;
+      throw new TmuxError(`Could not lock the subagent job registry at ${this.file}: ${errorMessage(error)}`, "command_failed");
+    }
+  }
+
+  /**
+   * Removes a lock whose owner is confirmed dead. The breaker file guarantees
+   * at most one remover at a time; while it is held, no other process can
+   * create or remove `lockPath`, so the token re-check and unlink are atomic
+   * with respect to every other contender. The breaker is never stolen: if a
+   * process dies while holding it, waiters fail closed rather than risk two
+   * concurrent removers.
+   */
+  private async breakStaleLock(lockPath: string, staleToken: string): Promise<boolean> {
+    const breakPath = `${lockPath}.break`;
+    const breakToken = `${process.pid}:${randomUUID()}`;
+    if (!(await this.tryCreateLock(breakPath, breakToken))) return false;
+    try {
+      const current = await this.readLockInfo(lockPath);
+      if (current?.token === staleToken) await rm(lockPath, { force: true }).catch(() => undefined);
+      return true;
+    } finally {
+      await this.removeOwnLock(breakPath, breakToken);
+    }
+  }
+
+  private async readLockInfo(lockPath: string): Promise<{ pid: number; token: string } | undefined> {
+    try {
+      const parsed = JSON.parse(await readFile(lockPath, "utf8")) as { pid?: unknown; token?: unknown };
+      if (!Number.isSafeInteger(parsed.pid) || (parsed.pid as number) <= 0 || typeof parsed.token !== "string" || !parsed.token) return undefined;
+      return { pid: parsed.pid as number, token: parsed.token };
+    } catch {
+      return undefined; // Missing, unreadable, or corrupt: never assume it is safe to break.
+    }
+  }
+
+  private async removeOwnLock(lockPath: string, token: string): Promise<void> {
+    const info = await this.readLockInfo(lockPath);
+    if (info?.token === token) await rm(lockPath, { force: true }).catch(() => undefined);
   }
 
   private async releaseLock(): Promise<void> {
-    const lockPath = this.lockPath();
-    try {
-      const parsed = JSON.parse(await readFile(lockPath, "utf8")) as { token?: unknown };
-      if (parsed.token !== this.lockToken) return; // Our stale lock was stolen; do not disturb the new owner.
-    } catch {
-      return;
-    }
-    await rm(lockPath, { force: true }).catch(() => undefined);
+    await this.removeOwnLock(this.lockPath(), this.lockToken);
+  }
+}
+
+/** A PID is only treated as dead on ESRCH; EPERM and unknown errors fail closed. */
+function isProcessAlive(pid: number): boolean {
+  if (pid === process.pid) return true;
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    return (error as NodeJS.ErrnoException).code !== "ESRCH";
   }
 }
 
