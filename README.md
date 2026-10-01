@@ -42,7 +42,7 @@ Caveats: the registry is local metadata, not cryptographic proof of ownership. S
 
 ## Subagent job registry (`SubagentJobV1`)
 
-A delegated Pi subagent is tracked as a durable job, separate from tmux target provenance, so completion state survives parent/child process restarts. This layer only defines and persists the model — it does not start Pi, detect completion, or notify the parent yet, but its API is shared by the parent-side extension and the follow-up Pi child completion reporter.
+A delegated Pi subagent is tracked as a durable job, separate from tmux target provenance, so completion state survives parent/child process restarts. This layer only defines and persists the model — it does not start Pi, detect completion, or notify the parent. The parent-side launcher is still to come; the API is shared by it and the packaged Pi child completion reporter described below.
 
 - Registry file: `$XDG_STATE_HOME/pi-tmux/subagent-jobs.json` (default `~/.local/state/pi-tmux/subagent-jobs.json`). Set `PI_TMUX_SUBAGENT_JOBS` to an absolute path to override it. The file is written `0600` inside a `0700` directory, fsynced, and replaced by atomic rename, so a crash never exposes a half-written file and readers never see a partial one.
 - Cross-process read-modify-write is serialized by an owner-only `${file}.lock` next to the state file. Locks are created by hard-linking a fully written temp file, so a crash can never expose an empty lock. A lock is only reclaimed when its recorded PID is confirmed dead (`ESRCH`); a lock held by a live process is never stolen, even when old — waiters fail closed with an actionable error after the timeout (default 10 seconds). Recovery of a dead lock is serialized through a short-lived `${file}.lock.break` file that is itself never stolen, so two contenders can never remove the same lock concurrently. If a process dies while holding the breaker, the registry fails closed and the named files must be removed manually.
@@ -52,6 +52,66 @@ A delegated Pi subagent is tracked as a durable job, separate from tmux target p
 - `reconcile({ live, serverIdentity })` marks non-terminal, bound jobs whose target is missing from the live tmux IDs as `lost`. It should be called with a view taken while the server is reachable.
 - Retention: active jobs and undelivered terminal jobs are never evicted. Acknowledged terminal history is capped at the 100 most recent (configurable); an absolute hard bound of 500 jobs protects the file, and `create` fails with a clear error at the bound rather than silently dropping live data.
 - The API lives in `src/subagent-jobs.ts` as `SubagentJobRegistry`. Corrupt, unexpected, or unknown-version state is reported and never overwritten.
+
+## Pi child completion reporter
+
+For a delegated **Pi** subagent, the child reports its own completion through Pi's `agent_settled` lifecycle event, so the parent never has to scrape pane output or wait for the pane to exit. `agent_end` is not used as the terminal signal because Pi may still continue through retry, compaction, or queued work.
+
+The reporter is packaged at `extensions/child-reporter.ts`. It is deliberately **not** auto-loaded: the package manifest still lists only `./extensions/index.ts`, and the reporter is announced for machine discovery as `pi.childReporter` in `package.json`. A parent loads it only for a delegated child:
+
+```sh
+pi --extension <package-root>/extensions/child-reporter.ts --mode json -p "…task…"
+```
+
+### Explicit environment contract
+
+| Variable | Required | Meaning |
+|---|---|---|
+| `PI_TMUX_SUBAGENT_JOB_ID` | yes | The `SubagentJobV1.jobId` the child reports on. The reporter reads and writes only this job. |
+| `PI_TMUX_SUBAGENT_STATE` | yes | Absolute path to the parent's subagent job registry file (`PI_TMUX_SUBAGENT_JOBS` or its default). A relative path is rejected. |
+| `PI_TMUX_PARENT_SESSION_ID` | conditional | Parent Pi session id. When the job records a parent it must match; when the job records a parent and the variable is absent the metadata is rejected as incomplete. |
+| `PI_TMUX_SUBAGENT_ANCESTORS` | no | Comma-separated job IDs already active in the child's ancestry. The reporter refuses to run when its own job id appears here, then adds its own id so grandchildren inherit the lineage (the recursive-loop guard). |
+
+Launch contract: the parent creates and binds the job, transitions it `created -> starting`, and only then starts the child with the variables above. The child's `TMUX_PANE` is checked against the job's bound `%N` pane when it is present, so a reporter loaded in the wrong pane is rejected rather than misreporting.
+
+### Lifecycle and completion
+
+- On `session_start` the reporter parses the metadata, requires the job to exist, be bound, and be `starting` (or already `running` after a reload), validates parent and pane identity, then moves `starting -> running`. Missing, partial, or invalid metadata fails visibly and mutates no job.
+- On `agent_settled` it derives the outcome from Pi's structured lifecycle data (`agent_before_settle`/`turn_end` outcome; `error`/`aborted` become `failed`, everything else `completed`), writes a bounded machine-readable payload, and moves `running -> completed|failed`. No pane text, prompts, or "done" strings are ever used.
+- It never creates jobs, starts children, notifies the parent, runs GitHub/workflow logic, or kills its own tmux session.
+
+The payload is `PiSubagentCompletionV1` at `$XDG_STATE_HOME/pi-tmux/subagent-reports/<jobId>.<unique>.json` next to the registry file (owner-only `0600`, fsynced, atomic rename), and the job's `resultPath` names exactly the winning file. Each attempt writes a unique immutable filename, so a duplicate or concurrent reporter, or a retry, can never overwrite another attempt's payload; the registry remains the arbiter of which payload wins, and losing payloads are removed best-effort:
+
+```ts
+interface PiSubagentCompletionV1 {
+  version: 1;
+  jobId: string;
+  status: "completed" | "failed";
+  childSessionId?: string;
+  finishedAt: string;
+  summary?: string;   // ≤ 4 KiB, last assistant message only
+  resultPath?: string;
+  error?: string;     // ≤ 2 KiB
+}
+```
+
+The summary is truncated from the final assistant message and the error is truncated; raw terminal scrollback and complete transcripts are never persisted.
+
+### Failure and recovery semantics
+
+| Situation | Behavior |
+|---|---|
+| Missing/invalid/unreadable metadata or registry | Reported loudly; no job is mutated; no terminal write is attempted. |
+| Job missing, unbound, still `created`, parent mismatch, self-parent, ancestor cycle, wrong pane | `session_start` fails visibly without touching the job. |
+| Pi exits before `agent_settled` | Job stays `running`; the parent marks it `lost` with `reconcile()` against a live tmux view. No output scraping. |
+| `agent_settled` fires more than once | The reporter settles once; the registry also treats a same-status terminal transition as a no-op. |
+| Duplicate/concurrent reporter or retry | Each attempt writes a unique immutable payload; the registry's `resultPath` names the winner and losing payloads are discarded, so a terminal `resultPath`'s contents are never overwritten. |
+| Parent cancelled or another terminal write raced first | The reporter sees the terminal status and leaves it unchanged; terminal outcomes are immutable. |
+| Completion payload write fails | Fail closed: the job is left `running` (parent-recoverable) instead of claiming a terminal outcome the parent cannot read. |
+| Registry terminal transition fails | Fail closed: the job is left `running`; an already-written payload is orphaned but bounded and safely rewritten on retry. |
+| Child crashes after the durable terminal write, before parent delivery | Still recoverable: `pendingDeliveries()` lists the terminal job until the parent acknowledges it with `markNotified()`. |
+
+The durable job registry is the single source of truth in every case.
 
 ## TUI: seeing what Pi created
 
