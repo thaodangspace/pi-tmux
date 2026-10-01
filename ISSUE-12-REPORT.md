@@ -162,4 +162,4 @@ New coverage:
 
 ## PR
 
-PR URL: _see below / recorded after opening._
+PR URL: https://github.com/thaodangspace/pi-tmux/pull/19
