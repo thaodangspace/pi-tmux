@@ -58,4 +58,4 @@ The 14 new reporter tests cover: env parsing, `starting -> running` + completion
 
 ## PR
 
-URL: _to be filled after creation._
+URL: https://github.com/thaodangspace/pi-tmux/pull/6 (base `main`, head `issue-2-child-reporter`; not merged; issue #2 left open).
