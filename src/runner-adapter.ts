@@ -68,6 +68,14 @@ export class RunnerAdapter implements AgentAdapter {
     this.placeholderCommand = options.placeholderCommand ?? "exec sleep 3600";
   }
 
+  validateOptions(input: SubagentTurnOptions): string | undefined {
+    // The config-driven runner has no bounded model/thinking contract yet; reject
+    // rather than silently ignore an option the caller believed was applied.
+    if (input.model !== undefined) return `The ${this.agent} runner adapter does not support a model option.`;
+    if (input.thinking !== undefined) return `The ${this.agent} runner adapter does not support a thinking option.`;
+    return undefined;
+  }
+
   async preflight(_input: SubagentTurnOptions): Promise<AgentPreflightResult> {
     let spec: RunnerSpecV1;
     try {

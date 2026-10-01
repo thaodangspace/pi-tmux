@@ -47,6 +47,13 @@ export interface AgentTurnContext {
   runId: string;
   /** Durable logical session identifier (equals `runId` for one-shot agents). */
   sessionId: string;
+  /**
+   * Which durable ledger backs this run. A one-shot `job` run and a multi-turn
+   * `session` turn share the launch contract but report completion differently,
+   * so an adapter (for example `PiAdapter`) needs to know which it is to emit the
+   * matching child-reporter metadata. Absent is treated as `"job"`.
+   */
+  ledgerKind?: "job" | "session";
   /** 1-based index of this turn within the logical session. */
   turnIndex: number;
   /** Comma-free lineage of durable run ids already active above this child. */

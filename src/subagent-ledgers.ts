@@ -23,6 +23,7 @@ import {
   isTerminalSessionStatus,
   isTerminalTurnStatus,
 } from "./subagent-sessions.ts";
+import { TmuxError } from "./tmux.ts";
 
 /**
  * Durable ledgers that adapt the two on-disk registries to the generic
@@ -130,6 +131,11 @@ export class SessionSubagentLedger implements SubagentLedger {
     await this.sessions.transitionSession(sessionId, "stopped", owner ? { parentPiSessionId: owner } : {});
   }
 
+  async transitionSession(sessionId: string, status: SubagentSessionStatus, owner?: string): Promise<SubagentSessionInfo> {
+    const session = await this.sessions.transitionSession(sessionId, status, owner ? { parentPiSessionId: owner } : {});
+    return sessionInfo(session);
+  }
+
   async bindRun(runId: string, input: BindSubagentRunInput, owner?: string): Promise<SubagentRunRecord> {
     const turn = await this.sessions.bindTurn(runId, { tmuxPaneId: input.tmuxPaneId }, owner ? { parentPiSessionId: owner } : {});
     return this.toRun(turn);
@@ -149,11 +155,28 @@ export class SessionSubagentLedger implements SubagentLedger {
     if (!isTerminalTurnStatus(current.status)) {
       await this.sessions.transitionTurn(runId, "cancelled", { ...(owner ? { parentPiSessionId: owner } : {}), ...(options.error ? { error: options.error } : {}) });
     }
-    const session = await this.sessions.getSession(current.sessionId);
-    if (session && !isTerminalSessionStatus(session.status)) {
-      await this.sessions.transitionSession(session.sessionId, "stopped", owner ? { parentPiSessionId: owner } : {});
+    return this.toRun(requireDefined(await this.sessions.getTurn(runId)));
+  }
+
+  /**
+   * Cancels exactly one turn without touching the logical session: the turn goes
+   * terminal and the session returns to `idle`, so it can run another turn. This
+   * is distinct from `stopSession`, which terminates the reusable session.
+   */
+  async cancelTurn(runId: string, options: { error?: string } = {}, owner?: string): Promise<SubagentRunRecord> {
+    const current = await this.sessions.getTurn(runId);
+    if (!current) throw new TmuxError(`Unknown subagent turn ${JSON.stringify(runId)}.`, "invalid_target");
+    if (!isTerminalTurnStatus(current.status)) {
+      await this.sessions.transitionTurn(runId, "cancelled", { ...(owner ? { parentPiSessionId: owner } : {}), ...(options.error ? { error: options.error } : {}) });
     }
     return this.toRun(requireDefined(await this.sessions.getTurn(runId)));
+  }
+
+  async listTurns(sessionId: string): Promise<SubagentRunRecord[]> {
+    const turns = await this.sessions.listTurns({ sessionId });
+    const runs: SubagentRunRecord[] = [];
+    for (const turn of turns) runs.push(await this.toRun(turn));
+    return runs;
   }
 
   async getRun(runId: string): Promise<SubagentRunRecord | undefined> {

@@ -1,8 +1,11 @@
 import { stat, realpath } from "node:fs/promises";
 import type { ExtensionAPI, ExtensionContext, ToolDefinition } from "@earendil-works/pi-coding-agent";
 import { Type, type TSchema } from "typebox";
+import { AgentAdapterRegistry } from "./agent-adapter.ts";
 import { confirmMutation } from "./confirm.ts";
+import { GenericSubagentController } from "./generic-subagent.ts";
 import { assertSamePlacement, checkOwnership } from "./ownership.ts";
+import { PiAdapter } from "./pi-adapter.ts";
 import {
   type PiSubagentControllerOptions,
   type PiSubagentFailure,
@@ -10,9 +13,13 @@ import {
   detectParentSession,
 } from "./pi-subagent.ts";
 import { Registry, isTrackedLive, type RegistryEntry, type RegistryKind } from "./registry.ts";
+import { RunnerAdapter } from "./runner-adapter.ts";
 import { SubagentJobRegistry } from "./subagent-jobs.ts";
+import { SUBAGENT_AGENTS, SubagentSessionRegistry, type SubagentAgent } from "./subagent-sessions.ts";
+import type { SubagentFailure } from "./subagent-controller.ts";
 import { Targets, type PaneTarget, type SessionTarget, type WindowTarget } from "./targets.ts";
 import { Tmux, TmuxError, errorMessage } from "./tmux.ts";
+import { type RunnerSpecV1, validateRunnerSpec } from "./turn-runner.ts";
 
 const Target = Type.String({ minLength: 1, description: "Explicit stable tmux ID from a listing (preferred), or an exact unambiguous name/index selector." });
 const SESSION = Type.Object({ target: Target });
@@ -21,6 +28,8 @@ const PANE = Type.Object({ target: Target });
 const KEYS = ["Enter", "Escape", "Tab", "BTab", "Space", "Backspace", "Delete", "Up", "Down", "Left", "Right", "Home", "End", "PageUp", "PageDown", "C-c", "C-d", "C-z", "C-\\", "C-a", "C-e", "C-l", "C-r", "C-u", "C-w"] as const;
 const SAFE_NAME = Type.String({ minLength: 1, maxLength: 64, description: "Name (no control characters)." });
 const JOB_ID = Type.String({ minLength: 1, maxLength: 512, description: "Durable subagent job ID returned by tmux_subagent_start_pi." });
+const SESSION_ID = Type.String({ minLength: 1, maxLength: 512, description: "Logical subagent session ID returned by tmux_subagent_create." });
+const TURN_ID = Type.String({ minLength: 1, maxLength: 512, description: "Logical subagent turn ID returned by tmux_subagent_run." });
 const THINKING_LEVELS = ["off", "minimal", "low", "medium", "high", "xhigh", "max"] as const;
 
 /** Injection points for tests; production callers use the defaults. */
@@ -29,13 +38,36 @@ export interface TmuxToolOptions {
   targets?: Targets;
   /** Reuse a durable subagent job registry. */
   jobs?: SubagentJobRegistry;
+  /** Reuse a durable logical session/turn registry. */
+  sessions?: SubagentSessionRegistry;
   /** Override Pi subagent launcher settings (binary, reporter path, probe, clock). */
   piSubagent?: Partial<Omit<PiSubagentControllerOptions, "tmux" | "registry" | "jobs" | "targets">>;
+  /**
+   * Agent adapters for the generic session/turn tools. Defaults to a Pi adapter
+   * plus one `RunnerAdapter` per `agentSpecs` entry. Tests inject fake adapters
+   * for Claude Code / OpenCode before their concrete adapters land.
+   */
+  adapters?: AgentAdapterRegistry;
+  /**
+   * Config-driven runner specs keyed by agent. Deployer-provided data only: no
+   * executable/argv value ever comes from the model.
+   */
+  agentSpecs?: Partial<Record<SubagentAgent, RunnerSpecV1>>;
 }
 
 export function registerTmuxTools(pi: ExtensionAPI, tmux = new Tmux(), registry = new Registry(), options: TmuxToolOptions = {}): void {
   const targets = options.targets ?? new Targets(tmux);
   const jobs = options.jobs ?? new SubagentJobRegistry();
+  const sessions = options.sessions ?? new SubagentSessionRegistry();
+  const adapters = options.adapters ?? buildDefaultAdapters(options);
+  const generic = new GenericSubagentController({
+    tmux,
+    registry,
+    targets,
+    sessions,
+    adapters,
+    ...options.piSubagent,
+  });
   const piSubagent = new PiSubagentController({ tmux, registry, jobs, targets, ...options.piSubagent });
   const register = <TParams extends TSchema>(definition: ToolDefinition<TParams>) => {
     const execute = definition.execute;
@@ -216,6 +248,80 @@ export function registerTmuxTools(pi: ExtensionAPI, tmux = new Tmux(), registry 
     return result("cancel Pi subagent", value);
   }});
 
+  // --- Generic, agent-neutral session/turn tools (issue #12) ------------------
+  // These are the preferred surface: they name no agent and expose no
+  // executable/argv/shell field. `tmux_subagent_start_pi` and the `jobId` form of
+  // status/cancel remain as the compatibility path for the one-shot Pi job API.
+  register({ name: "tmux_subagent_create", label: "Create subagent session", description: "Create a reusable, agent-neutral subagent session owned by this Pi conversation, bound to a dedicated detached tmux session. Starts no turn; use tmux_subagent_run afterwards. The agent must be one whose adapter is configured (pi, or a configured claude-code/opencode runner). No executable or argv is accepted.", promptSnippet: "Create a reusable subagent session", parameters: Type.Object({
+    agent: Type.Union(SUBAGENT_AGENTS.map((agent) => Type.Literal(agent))),
+    cwd: Type.String({ minLength: 1, description: "Absolute, existing working directory for the child." }),
+    name: Type.Optional(SAFE_NAME),
+    parent: Type.Optional(Target),
+    model: Type.Optional(Type.String({ minLength: 1, maxLength: 128, description: "Optional adapter-validated model selection." })),
+    thinking: Type.Optional(Type.Union(THINKING_LEVELS.map((level) => Type.Literal(level)))),
+  }), async execute(_id, p, signal, _update, ctx) {
+    const outcome = await generic.create({ agent: p.agent, cwd: p.cwd, name: p.name, parent: p.parent, model: p.model, thinking: p.thinking }, ctx.sessionManager.getSessionId(), signal);
+    if (!outcome.ok) return subagentFailure("create subagent session", outcome);
+    const { ok: _ok, ...value } = outcome;
+    return result("create subagent session", value);
+  }});
+  register({ name: "tmux_subagent_run", label: "Run subagent turn", description: "Run one bounded task as a new turn on an existing reusable subagent session owned by this Pi conversation. Rejects a second concurrent turn on the same session. A terminal turn returns the session to idle; run another turn to continue the same logical session. The working directory is the session's, never caller-supplied.", promptSnippet: "Run a turn on a reusable subagent session", parameters: Type.Object({
+    sessionId: SESSION_ID,
+    task: Type.String({ minLength: 1, maxLength: 20000, description: "Bounded task/prompt delivered verbatim; never interpolated into a shell." }),
+    model: Type.Optional(Type.String({ minLength: 1, maxLength: 128, description: "Optional adapter-validated model selection." })),
+    thinking: Type.Optional(Type.Union(THINKING_LEVELS.map((level) => Type.Literal(level)))),
+  }), async execute(_id, p, signal, _update, ctx) {
+    const outcome = await generic.run(p.sessionId, { task: p.task, model: p.model, thinking: p.thinking }, ctx.sessionManager.getSessionId(), signal);
+    if (!outcome.ok) return subagentFailure("run subagent turn", outcome);
+    const { ok: _ok, ...value } = outcome;
+    return result("run subagent turn", { ...value, turnId: value.runId });
+  }});
+  register({ name: "tmux_subagent_status", label: "Subagent status", description: "Return durable lifecycle state owned by this Pi conversation. Pass sessionId (optionally with turnId) for a reusable session, or jobId for a legacy one-shot Pi job. Never infers completion from pane text; a vanished or re-identified target is reconciled to `lost` when tmux is reachable.", promptSnippet: "Show durable state of a subagent session, turn, or Pi job", parameters: Type.Object({ sessionId: Type.Optional(SESSION_ID), turnId: Type.Optional(TURN_ID), jobId: Type.Optional(JOB_ID) }), async execute(_id, p, signal, _update, ctx) {
+    const owner = ctx.sessionManager.getSessionId();
+    if (p.sessionId !== undefined) {
+      if (p.jobId !== undefined) throw new TmuxError("Provide either sessionId or jobId, not both.", "invalid_option");
+      const outcome = await generic.status(p.sessionId, owner, p.turnId, signal);
+      if (!outcome.ok) return subagentFailure("subagent status", outcome);
+      const { ok: _ok, turn, ...value } = outcome;
+      return result("subagent status", {
+        ...value,
+        ...(turn ? { turn: { ...turn, turnId: turn.runId } } : {}),
+      });
+    }
+    if (p.jobId !== undefined) {
+      if (p.turnId !== undefined) throw new TmuxError("turnId applies only to a sessionId status.", "invalid_option");
+      const outcome = await piSubagent.status(p.jobId, owner, signal);
+      if (!outcome.ok) return failure("Pi subagent status", outcome);
+      const { ok: _ok, ...value } = outcome;
+      return result("Pi subagent status", value);
+    }
+    throw new TmuxError("Provide sessionId (reusable session) or jobId (legacy Pi job).", "invalid_option");
+  }});
+  register({ name: "tmux_subagent_cancel", label: "Cancel subagent", description: "Cancel active work owned by this Pi conversation. Pass sessionId (optionally turnId) to cancel a reusable session's active turn, leaving the session reusable; or jobId to cancel a legacy one-shot Pi job and kill its recorded tmux target. Only a positively verified target is ever killed; cancellation is idempotent.", promptSnippet: "Cancel an active subagent turn or a Pi job", parameters: Type.Object({ sessionId: Type.Optional(SESSION_ID), turnId: Type.Optional(TURN_ID), jobId: Type.Optional(JOB_ID) }), async execute(_id, p, signal, _update, ctx) {
+    const owner = ctx.sessionManager.getSessionId();
+    if (p.sessionId !== undefined) {
+      if (p.jobId !== undefined) throw new TmuxError("Provide either sessionId or jobId, not both.", "invalid_option");
+      const outcome = await generic.cancel(p.sessionId, owner, p.turnId, signal);
+      if (!outcome.ok) return subagentFailure("cancel subagent turn", outcome);
+      const { ok: _ok, ...value } = outcome;
+      return result("cancel subagent turn", value);
+    }
+    if (p.jobId !== undefined) {
+      if (p.turnId !== undefined) throw new TmuxError("turnId applies only to a sessionId cancel.", "invalid_option");
+      const outcome = await piSubagent.cancel(p.jobId, owner, signal);
+      if (!outcome.ok) return failure("cancel Pi subagent", outcome);
+      const { ok: _ok, ...value } = outcome;
+      return result("cancel Pi subagent", value);
+    }
+    throw new TmuxError("Provide sessionId (reusable session) or jobId (legacy Pi job).", "invalid_option");
+  }});
+  register({ name: "tmux_subagent_close", label: "Close subagent session", description: "Stop a reusable subagent session owned by this Pi conversation and tear down only its verified tmux session. Any active turn is cancelled first. Idempotent once the session is stopped/lost; never kills a reused or unverified target.", promptSnippet: "Close a reusable subagent session and its tmux boundary", parameters: Type.Object({ sessionId: SESSION_ID }), async execute(_id, p, signal, _update, ctx) {
+    const outcome = await generic.close(p.sessionId, ctx.sessionManager.getSessionId(), signal);
+    if (!outcome.ok) return subagentFailure("close subagent session", outcome);
+    const { ok: _ok, ...value } = outcome;
+    return result("close subagent session", value);
+  }});
+
   registerKill("tmux_kill_session", "session", "session", (selector, signal) => targets.session(selector, signal), (t) => t.id, (t) => `${t.name} (${t.id})`);
   registerKill("tmux_kill_window", "window", "window", (selector, signal) => targets.window(selector, signal), (t) => t.id, (t) => `${t.sessionName}:${t.name} (${t.id})`);
   registerKill("tmux_kill_pane", "pane", "pane", (selector, signal) => targets.pane(selector, signal), (t) => t.id, describePane);
@@ -361,12 +467,68 @@ export function failure(operation: string, outcome: PiSubagentFailure) {
   return { content: [{ type: "text" as const, text: `tmux error: ${JSON.stringify(details)}` }], isError: true, details };
 }
 
+/** Structured `isError` result for a generic subagent operation that failed. */
+export function subagentFailure(operation: string, outcome: SubagentFailure) {
+  const details = {
+    operation,
+    ...(outcome.sessionId ? { sessionId: outcome.sessionId } : {}),
+    ...(outcome.runId ? { runId: outcome.runId } : {}),
+    ...(outcome.status ? { status: outcome.status } : {}),
+    ...(outcome.cleanedUp !== undefined ? { cleanedUp: outcome.cleanedUp } : {}),
+    code: outcome.code,
+    error: outcome.error,
+  };
+  return { content: [{ type: "text" as const, text: `tmux error: ${JSON.stringify(details)}` }], isError: true, details };
+}
+
+/**
+ * Builds the default agent adapter registry: a Pi adapter plus one config-driven
+ * runner adapter per `agentSpecs` (or `PI_TMUX_AGENT_SPECS`) entry. A malformed
+ * spec is skipped so a bad deployer configuration cannot break Pi; the agent then
+ * simply reports that no adapter is registered.
+ */
+function buildDefaultAdapters(options: TmuxToolOptions): AgentAdapterRegistry {
+  const adapters = new AgentAdapterRegistry([new PiAdapter(options.piSubagent)]);
+  const specs = { ...readAgentSpecsFromEnv(), ...(options.agentSpecs ?? {}) };
+  for (const [agent, spec] of Object.entries(specs)) {
+    if (!spec || !SUBAGENT_AGENTS.includes(agent as SubagentAgent)) continue;
+    try {
+      const validated = validateRunnerSpec(spec, { requireAbsoluteExecutable: false });
+      adapters.register(new RunnerAdapter({ agent: agent as SubagentAgent, spec: validated }));
+    } catch {
+      /* A malformed deployer spec is ignored; no agent-specific tool is invented. */
+    }
+  }
+  return adapters;
+}
+
+/** Deployer-provided runner specs as a JSON object keyed by agent. */
+function readAgentSpecsFromEnv(env: NodeJS.ProcessEnv = process.env): Partial<Record<SubagentAgent, RunnerSpecV1>> {
+  const raw = env.PI_TMUX_AGENT_SPECS;
+  if (typeof raw !== "string" || !raw.trim()) return {};
+  try {
+    const parsed: unknown = JSON.parse(raw);
+    if (parsed !== null && typeof parsed === "object" && !Array.isArray(parsed)) return parsed as Partial<Record<SubagentAgent, RunnerSpecV1>>;
+  } catch { /* Ignored; surfaced as "no adapter registered" at call time. */ }
+  return {};
+}
+
 export function toolError(error: unknown, operation?: string, params?: unknown) {
   const message = error instanceof TmuxError ? error.message : errorMessage(error);
   const record = params !== null && typeof params === "object" ? params as Record<string, unknown> : {};
   const target = [record.target, record.session, record.window].find((value) => typeof value === "string");
   const jobId = typeof record.jobId === "string" ? record.jobId : undefined;
+  const sessionId = typeof record.sessionId === "string" ? record.sessionId : undefined;
+  const turnId = typeof record.turnId === "string" ? record.turnId : undefined;
   const code = error instanceof TmuxError ? error.code : "command_failed";
-  const details = { ...(operation ? { operation } : {}), ...(target ? { target } : {}), ...(jobId ? { jobId } : {}), code, error: message };
+  const details = {
+    ...(operation ? { operation } : {}),
+    ...(target ? { target } : {}),
+    ...(jobId ? { jobId } : {}),
+    ...(sessionId ? { sessionId } : {}),
+    ...(turnId ? { turnId } : {}),
+    code,
+    error: message,
+  };
   return { content: [{ type: "text" as const, text: `tmux error: ${JSON.stringify(details)}` }], isError: true, details };
 }
