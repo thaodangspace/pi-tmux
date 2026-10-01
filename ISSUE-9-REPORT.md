@@ -143,4 +143,4 @@ fail-before-write.
 
 ## PR
 
-PR URL: _pending — recorded in a follow-up commit immediately after opening the pull request._
+PR URL: https://github.com/thaodangspace/pi-tmux/pull/16
