@@ -1,6 +1,8 @@
 import path from "node:path";
 import {
   type AgentAdapter,
+  type AgentInteractiveContext,
+  type AgentInteractiveLaunchSpec,
   type AgentLaunchSpec,
   type AgentPreflightResult,
   type AgentTurnContext,
@@ -52,6 +54,12 @@ export const OPENCODE_SUBAGENT_ENV = {
   bin: "PI_TMUX_OPENCODE_BIN",
 } as const;
 
+/** Environment variables carried into an interactive OpenCode TUI launch. */
+export const OPENCODE_INTERACTIVE_ENV = {
+  /** Optional validated model selection for the TUI. */
+  model: "PI_TMUX_OPENCODE_INTERACTIVE_MODEL",
+} as const;
+
 export const DEFAULT_OPENCODE_COMMAND = "opencode";
 export const OPENCODE_PLACEHOLDER_COMMAND = "exec sleep 3600";
 
@@ -100,6 +108,7 @@ export class OpenCodeAdapter implements AgentAdapter {
   readonly sessionNamePrefix = "opencode-subagent";
   readonly provenanceTool = "tmux_subagent_start_opencode";
   readonly placeholderCommand = OPENCODE_PLACEHOLDER_COMMAND;
+  readonly supportsInteractive = true;
 
   private readonly resolveOpencode: (command: string) => Promise<string | undefined>;
   private readonly opencodeCommand: string;
@@ -126,19 +135,9 @@ export class OpenCodeAdapter implements AgentAdapter {
   }
 
   async preflight(_input: SubagentTurnOptions): Promise<AgentPreflightResult> {
-    if (path.isAbsolute(this.opencodeCommand) && !(await isFile(this.opencodeCommand))) {
-      return { ok: false, code: "unavailable", error: `The configured OpenCode executable ${this.opencodeCommand} does not exist.` };
-    }
-
-    let executable: string | undefined;
-    try {
-      executable = await this.resolveOpencode(this.opencodeCommand);
-    } catch (error) {
-      return { ok: false, code: "command_failed", error: `Could not resolve the OpenCode executable: ${errorMessage(error)}` };
-    }
-    if (!executable) {
-      return { ok: false, code: "unavailable", error: `The OpenCode CLI (${this.opencodeCommand}) was not found on PATH; install it or configure it before starting an opencode subagent.` };
-    }
+    const resolved = await this.resolveOpencodeBin();
+    if (!resolved.ok) return resolved;
+    const { executable } = resolved;
 
     if (!(await isFile(this.runnerModule))) {
       return { ok: false, code: "unavailable", error: `The packaged turn runner was not found at ${this.runnerModule}.` };
@@ -162,6 +161,59 @@ export class OpenCodeAdapter implements AgentAdapter {
       },
       metadata: opencodeIsolationMetadata(),
     };
+  }
+
+  /**
+   * Interactive-mode preflight (issue #15): resolve the `opencode` executable
+   * only. No turn runner is involved. It returns the same bounded, non-secret
+   * isolation metadata as `preflight`.
+   */
+  async preflightInteractive(_input: SubagentTurnOptions): Promise<AgentPreflightResult> {
+    const resolved = await this.resolveOpencodeBin();
+    if (!resolved.ok) return resolved;
+    return {
+      ok: true,
+      env: { [OPENCODE_SUBAGENT_ENV.bin]: resolved.executable },
+      metadata: opencodeIsolationMetadata(),
+    };
+  }
+
+  /**
+   * Builds the constant interactive TUI command. `--standalone` is always
+   * present so the managed TUI runs a private server in the owned process tree
+   * instead of attaching to the user's shared background daemon. No `--auto`,
+   * `--attach`, or permission-disabling flag is ever added.
+   */
+  async prepareInteractive(input: SubagentTurnOptions, context: AgentInteractiveContext): Promise<AgentInteractiveLaunchSpec> {
+    const optionsError = this.validateOptions(input);
+    if (optionsError) throw new TmuxError(optionsError, "invalid_option");
+
+    const executable = context.preflight[OPENCODE_SUBAGENT_ENV.bin];
+    if (!executable) {
+      throw new TmuxError("The OpenCode executable was not resolved during preflight; refusing to launch.", "invalid_option");
+    }
+    const withModel = input.model !== undefined;
+    return {
+      command: opencodeInteractiveCommand(withModel),
+      env: withModel ? { [OPENCODE_INTERACTIVE_ENV.model]: input.model! } : {},
+    };
+  }
+
+  /** Resolves the configured `opencode` command without a shell. */
+  private async resolveOpencodeBin(): Promise<{ ok: true; executable: string } | { ok: false; code: TmuxError["code"]; error: string }> {
+    if (path.isAbsolute(this.opencodeCommand) && !(await isFile(this.opencodeCommand))) {
+      return { ok: false, code: "unavailable", error: `The configured OpenCode executable ${this.opencodeCommand} does not exist.` };
+    }
+    let executable: string | undefined;
+    try {
+      executable = await this.resolveOpencode(this.opencodeCommand);
+    } catch (error) {
+      return { ok: false, code: "command_failed", error: `Could not resolve the OpenCode executable: ${errorMessage(error)}` };
+    }
+    if (!executable) {
+      return { ok: false, code: "unavailable", error: `The OpenCode CLI (${this.opencodeCommand}) was not found on PATH; install it or configure it before starting an opencode subagent.` };
+    }
+    return { ok: true, executable };
   }
 
   async prepareTurn(input: SubagentTurnOptions, context: AgentTurnContext): Promise<AgentLaunchSpec> {
@@ -235,6 +287,18 @@ export function opencodeTurnArgs(options: { model?: string; session?: string } =
   return args;
 }
 
+/**
+ * The finite interactive OpenCode TUI argv. `--standalone` is always first so a
+ * managed TUI can never attach to the shared background service; the model is
+ * only ever referenced as a quoted environment expansion. `--auto` is never
+ * added.
+ */
+export function opencodeInteractiveCommand(withModel: boolean): string {
+  const parts = [`exec "$${OPENCODE_SUBAGENT_ENV.bin}"`, "--standalone"];
+  if (withModel) parts.push(`--model "$${OPENCODE_INTERACTIVE_ENV.model}"`);
+  return parts.join(" ");
+}
+
 /** Returns an error message when a native session id is not a safe, bounded argv token. */
 export function validateOpencodeSessionId(value: string): string | undefined {
   if (!value || value.includes("\0") || Buffer.byteLength(value, "utf8") > MAX_SESSION_ID_BYTES || !SESSION_ID_PATTERN.test(value)) {
@@ -252,6 +316,6 @@ export function opencodeIsolationMetadata(): Readonly<Record<string, string>> {
   return {
     opencodeRuntime: "standalone-private-server",
     opencodeIsolationNote:
-      "Managed turns always run `opencode run --standalone` inside the pi-tmux-owned tmux session, so the session, permissions, and tool execution live in a private server in the owned process tree instead of the shared background service. pi-tmux injects no provider credentials and passes no --auto or --dangerously-skip-permissions flag.",
+      "Managed turns and interactive sessions always run OpenCode with --standalone inside the pi-tmux-owned tmux session, so the session, permissions, and tool execution live in a private server in the owned process tree instead of the shared background service. pi-tmux injects no provider credentials and passes no --auto or --dangerously-skip-permissions flag.",
   };
 }

@@ -108,11 +108,20 @@ export class SessionSubagentLedger implements SubagentLedger {
   }
 
   async createSession(input: CreateSubagentRunInput): Promise<SubagentSessionInfo> {
-    return sessionInfo(await this.sessions.createSession({ agent: input.agent, cwd: input.cwd, parentPiSessionId: input.owner }));
+    return sessionInfo(await this.sessions.createSession({
+      agent: input.agent,
+      cwd: input.cwd,
+      parentPiSessionId: input.owner,
+      ...(input.mode !== undefined ? { mode: input.mode } : {}),
+    }));
   }
 
-  async bindSession(sessionId: string, input: { tmuxSessionId: string; serverIdentity?: string }, owner?: string): Promise<void> {
-    await this.sessions.bindSession(sessionId, { tmuxSessionId: input.tmuxSessionId, serverIdentity: input.serverIdentity }, owner ? { parentPiSessionId: owner } : {});
+  async bindSession(sessionId: string, input: { tmuxSessionId: string; tmuxPaneId?: string; serverIdentity?: string }, owner?: string): Promise<void> {
+    await this.sessions.bindSession(sessionId, {
+      tmuxSessionId: input.tmuxSessionId,
+      ...(input.tmuxPaneId !== undefined ? { tmuxPaneId: input.tmuxPaneId } : {}),
+      ...(input.serverIdentity !== undefined ? { serverIdentity: input.serverIdentity } : {}),
+    }, owner ? { parentPiSessionId: owner } : {});
   }
 
   async createTurn(sessionId: string, owner?: string): Promise<SubagentRunRecord> {
@@ -226,7 +235,9 @@ function sessionInfo(session: SubagentSessionV1): SubagentSessionInfo {
     owner: session.parentPiSessionId,
     cwd: session.cwd,
     status: session.status,
+    mode: session.mode ?? "turns",
     tmuxSessionId: session.tmuxSessionId,
+    tmuxPaneId: session.tmuxPaneId ?? null,
     ...(session.serverIdentity ? { serverIdentity: session.serverIdentity } : {}),
     ...(session.agentSessionId ? { agentSessionId: session.agentSessionId } : {}),
   };

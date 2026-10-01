@@ -1,7 +1,7 @@
 import type { AgentAdapterRegistry } from "./agent-adapter.ts";
 import type { Registry } from "./registry.ts";
 import { SessionSubagentLedger } from "./subagent-ledgers.ts";
-import type { SubagentAgent } from "./subagent-sessions.ts";
+import type { SubagentAgent, SubagentSessionMode } from "./subagent-sessions.ts";
 import { SubagentSessionRegistry } from "./subagent-sessions.ts";
 import {
   type SubagentCancelTurnResult,
@@ -32,6 +32,8 @@ export interface SubagentCreateInput {
   parent?: string;
   model?: string;
   thinking?: string;
+  /** `turns` (default) creates a reusable structured-turn session; `interactive` launches the agent TUI. */
+  mode?: SubagentSessionMode;
 }
 
 export interface SubagentRunInput {
@@ -64,8 +66,16 @@ export class GenericSubagentController {
     if (!adapter) return fail("invalid_option", `No adapter is registered for agent ${JSON.stringify(input?.agent)}.`);
     const controller = this.controllerFor(adapter.agent);
     if (!controller) return fail("invalid_option", `No adapter is registered for agent ${JSON.stringify(input?.agent)}.`);
+    const mode = input.mode ?? "turns";
+    if (mode !== "turns" && mode !== "interactive") {
+      return fail("invalid_option", `mode must be "turns" or "interactive".`);
+    }
     // `create` has no task; adapters must not require one during preflight.
-    return controller.createSession({ cwd: input.cwd, task: "", name: input.name, parent: input.parent, model: input.model, thinking: input.thinking, agent: adapter.agent }, owner, signal);
+    const common = { cwd: input.cwd, task: "", name: input.name, parent: input.parent, model: input.model, thinking: input.thinking, agent: adapter.agent };
+    if (mode === "interactive") {
+      return controller.createInteractiveSession(common, owner, signal);
+    }
+    return controller.createSession(common, owner, signal);
   }
 
   /** Runs one turn on an existing reusable session. */

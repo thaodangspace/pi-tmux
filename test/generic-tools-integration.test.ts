@@ -6,6 +6,7 @@ import path from "node:path";
 import test from "node:test";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { AgentAdapterRegistry } from "../src/agent-adapter.ts";
+import { ClaudeCodeAdapter } from "../src/claude-adapter.ts";
 import { OpenCodeAdapter } from "../src/opencode-adapter.ts";
 import { PiAdapter } from "../src/pi-adapter.ts";
 import { defaultChildReporterPath } from "../src/pi-subagent.ts";
@@ -213,6 +214,137 @@ test("an OpenCode adapter is driven through the generic tools end to end", { ski
   }
 });
 
+test("an interactive Claude Code TUI runs in the owned pane and is inspected/sent/closed through the generic tools", { skip: !available }, async () => {
+  const directory = await mkdtemp(path.join(os.tmpdir(), "generic-interactive-e2e-"));
+  const socket = path.join(directory, "s");
+  const tmux = new Tmux({ socket });
+  const sessions = new SubagentSessionRegistry(path.join(directory, "sessions.json"));
+  const agent = path.join(directory, "claude");
+  await writeFile(agent, "#!/bin/sh\necho TUI-READY\nsleep 60\n", "utf8");
+  await chmod(agent, 0o755);
+
+  try {
+    await runTmux(socket, ["-f", "/dev/null", "new-session", "-d", "-s", "bootstrap"]);
+    await runTmux(socket, ["set-option", "-g", "default-shell", "/bin/sh"]);
+    await runTmux(socket, ["set-option", "-s", "exit-empty", "off"]);
+    await runTmux(socket, ["kill-session", "-t", "bootstrap"]);
+
+    const tools: Record<string, any> = {};
+    registerTmuxTools(
+      { registerTool(tool: any) { tools[tool.name] = tool; } } as unknown as ExtensionAPI,
+      tmux,
+      new Registry(path.join(directory, "registry.json")),
+      {
+        targets: new Targets(tmux),
+        sessions,
+        jobs: new SubagentJobRegistry(path.join(directory, "jobs.json")),
+        adapters: new AgentAdapterRegistry([new ClaudeCodeAdapter({ claudeCommand: agent, env: {} })]),
+      },
+    );
+    const owner = "pi-parent";
+    const context = { hasUI: false, sessionManager: { getSessionId: () => owner }, ui: {} } as unknown as ExtensionContext;
+    const call = (name: string, params: Record<string, unknown>) => tools[name].execute("call", params, undefined, undefined, context);
+    const body = (value: any) => JSON.parse(value.content[0].text);
+
+    const created = await call("tmux_subagent_create", { agent: "claude-code", cwd: directory, mode: "interactive", name: "claude-tui" });
+    assert.equal(created.isError, undefined, created.content[0].text);
+    const createdBody = body(created);
+    const sessionId = createdBody.sessionId as string;
+    assert.equal(createdBody.mode, "interactive");
+    assert.equal(createdBody.status, "interactive");
+    assert.match(createdBody.tmuxSessionId, /^\$\d+$/);
+    assert.match(createdBody.tmuxPaneId, /^%\d+$/);
+
+    // No turn exists, so running one is refused; the TUI is not a turn.
+    const run = await call("tmux_subagent_run", { sessionId, task: "do work" });
+    assert.equal(run.isError, true, "an interactive session rejects structured turns");
+
+    // The owned pane is inspectable and capturable with the existing tmux tools.
+    const paneId = createdBody.tmuxPaneId as string;
+    const captured = await waitForCapture(call, paneId);
+    assert.equal(captured.isError, undefined, JSON.stringify(captured));
+    assert.ok(String(body(captured).snapshot).includes("TUI-READY"), "the owned TUI output is captured");
+
+    // Sending literal text to the owned pane needs no confirmation.
+    const sent = await call("tmux_send_text", { target: paneId, text: "hello" });
+    assert.equal(sent.isError, undefined, sent.content[0].text);
+
+    // Status reports durable interactive state (no fabricated completion).
+    const status = await call("tmux_subagent_status", { sessionId });
+    assert.equal(status.isError, undefined, status.content[0].text);
+    assert.equal(body(status).session.mode, "interactive");
+    assert.equal(body(status).session.status, "interactive");
+    assert.equal(body(status).session.tmuxPaneId, paneId);
+    assert.equal(body(status).turn, undefined, "no turn completion is fabricated");
+
+    const closed = await call("tmux_subagent_close", { sessionId });
+    assert.equal(closed.isError, undefined, closed.content[0].text);
+    assert.equal(body(closed).status, "stopped");
+    assert.equal(body(closed).targetRemoved, true);
+    const live = await targetsLive(tmux);
+    assert.equal(live.live.size, 0, "close removed the interactive tmux session");
+  } finally {
+    try { await tmux.run(["kill-server"]); } catch { /* Server may not have started. */ }
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("an interactive OpenCode TUI runs with --standalone in the owned pane", { skip: !available }, async () => {
+  const directory = await mkdtemp(path.join(os.tmpdir(), "generic-interactive-oc-"));
+  const socket = path.join(directory, "s");
+  const tmux = new Tmux({ socket });
+  const sessions = new SubagentSessionRegistry(path.join(directory, "sessions.json"));
+  const agent = path.join(directory, "opencode");
+  const argvLog = path.join(directory, "argv.log");
+  await writeFile(agent, `#!/bin/sh\nprintf '%s\\n' "$@" > '${argvLog}'\necho OC-TUI-READY\nsleep 60\n`, "utf8");
+  await chmod(agent, 0o755);
+
+  try {
+    await runTmux(socket, ["-f", "/dev/null", "new-session", "-d", "-s", "bootstrap"]);
+    await runTmux(socket, ["set-option", "-g", "default-shell", "/bin/sh"]);
+    await runTmux(socket, ["set-option", "-s", "exit-empty", "off"]);
+    await runTmux(socket, ["kill-session", "-t", "bootstrap"]);
+
+    const tools: Record<string, any> = {};
+    registerTmuxTools(
+      { registerTool(tool: any) { tools[tool.name] = tool; } } as unknown as ExtensionAPI,
+      tmux,
+      new Registry(path.join(directory, "registry.json")),
+      {
+        targets: new Targets(tmux),
+        sessions,
+        jobs: new SubagentJobRegistry(path.join(directory, "jobs.json")),
+        adapters: new AgentAdapterRegistry([new OpenCodeAdapter({ opencodeCommand: agent })]),
+      },
+    );
+    const owner = "pi-parent";
+    const context = { hasUI: false, sessionManager: { getSessionId: () => owner }, ui: {} } as unknown as ExtensionContext;
+    const call = (name: string, params: Record<string, unknown>) => tools[name].execute("call", params, undefined, undefined, context);
+    const body = (value: any) => JSON.parse(value.content[0].text);
+
+    const created = await call("tmux_subagent_create", { agent: "opencode", cwd: directory, mode: "interactive", model: "anthropic/claude-sonnet-4-5" });
+    assert.equal(created.isError, undefined, created.content[0].text);
+    assert.equal(body(created).mode, "interactive");
+    assert.equal(body(created).status, "interactive");
+    assert.equal(body(created).metadata.opencodeRuntime, "standalone-private-server");
+
+    // The managed TUI actually received --standalone and the model, and never
+    // attached to the shared daemon or weakened permissions.
+    const argv = await waitForArgv(argvLog);
+    assert.deepEqual(argv, ["--standalone", "--model", "anthropic/claude-sonnet-4-5"]);
+    for (const forbidden of ["--auto", "--attach", "--yolo", "--dangerously-skip-permissions", "--continue"]) {
+      assert.equal(argv.includes(forbidden), false);
+    }
+
+    const closed = await call("tmux_subagent_close", { sessionId: body(created).sessionId });
+    assert.equal(closed.isError, undefined, closed.content[0].text);
+    assert.equal(body(closed).status, "stopped");
+  } finally {
+    try { await tmux.run(["kill-server"]); } catch { /* Server may not have started. */ }
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
 test("a Pi child is driven through the generic tools with the session-mode reporter contract", { skip: !available }, async () => {
   const directory = await mkdtemp(path.join(os.tmpdir(), "generic-pi-e2e-"));
   const socket = path.join(directory, "s");
@@ -278,6 +410,29 @@ test("a Pi child is driven through the generic tools with the session-mode repor
     await rm(directory, { recursive: true, force: true });
   }
 });
+
+async function waitForArgv(file: string, timeoutMs = 5_000): Promise<string[]> {
+  const deadline = Date.now() + timeoutMs;
+  for (;;) {
+    try {
+      const text = (await readFile(file, "utf8")).trim();
+      if (text) return text.split("\n");
+    } catch { /* not yet */ }
+    if (Date.now() >= deadline) throw new Error(`Timed out waiting for ${file}`);
+    await new Promise((resolve) => setTimeout(resolve, 50));
+  }
+}
+
+async function waitForCapture(call: (name: string, params: Record<string, unknown>) => Promise<any>, paneId: string, timeoutMs = 10_000) {
+  const deadline = Date.now() + timeoutMs;
+  let last: any;
+  for (;;) {
+    last = await call("tmux_capture_pane", { target: paneId });
+    if (last.isError === undefined && String(last.content[0]?.text ?? "").includes("TUI-READY")) return last;
+    if (Date.now() >= deadline) return last;
+    await new Promise((resolve) => setTimeout(resolve, 100));
+  }
+}
 
 async function waitForTerminal(registry: SubagentSessionRegistry, turnId: string, timeoutMs = 20_000) {
   const deadline = Date.now() + timeoutMs;

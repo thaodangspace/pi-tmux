@@ -17,7 +17,7 @@ import {
 import { Registry, isTrackedLive, type RegistryEntry, type RegistryKind } from "./registry.ts";
 import { RunnerAdapter } from "./runner-adapter.ts";
 import { SubagentJobRegistry } from "./subagent-jobs.ts";
-import { SUBAGENT_AGENTS, SubagentSessionRegistry, type SubagentAgent } from "./subagent-sessions.ts";
+import { SUBAGENT_AGENTS, SUBAGENT_SESSION_MODES, SubagentSessionRegistry, type SubagentAgent } from "./subagent-sessions.ts";
 import type { SubagentFailure } from "./subagent-controller.ts";
 import { Targets, type PaneTarget, type SessionTarget, type WindowTarget } from "./targets.ts";
 import { Tmux, TmuxError, errorMessage } from "./tmux.ts";
@@ -254,15 +254,16 @@ export function registerTmuxTools(pi: ExtensionAPI, tmux = new Tmux(), registry 
   // These are the preferred surface: they name no agent and expose no
   // executable/argv/shell field. `tmux_subagent_start_pi` and the `jobId` form of
   // status/cancel remain as the compatibility path for the one-shot Pi job API.
-  register({ name: "tmux_subagent_create", label: "Create subagent session", description: "Create a reusable, agent-neutral subagent session owned by this Pi conversation, bound to a dedicated detached tmux session. Starts no turn; use tmux_subagent_run afterwards. The agent must be one whose adapter is configured (pi, claude-code, or opencode by default; a deployer runner spec may override one). No executable or argv is accepted.", promptSnippet: "Create a reusable subagent session", parameters: Type.Object({
+  register({ name: "tmux_subagent_create", label: "Create subagent session", description: "Create a reusable, agent-neutral subagent session owned by this Pi conversation, bound to a dedicated detached tmux session. Default mode \"turns\" starts no turn; use tmux_subagent_run afterwards. Mode \"interactive\" (claude-code or opencode) launches the agent's own TUI in the owned pane instead: liveness is process/tmux liveness, never inferred from pane text, and no turn completion is ever fabricated. The agent must be one whose adapter is configured (pi, claude-code, or opencode by default; a deployer runner spec may override one). No executable or argv is accepted.", promptSnippet: "Create a reusable subagent session", parameters: Type.Object({
     agent: Type.Union(SUBAGENT_AGENTS.map((agent) => Type.Literal(agent))),
     cwd: Type.String({ minLength: 1, description: "Absolute, existing working directory for the child." }),
+    mode: Type.Optional(Type.Union(SUBAGENT_SESSION_MODES.map((mode) => Type.Literal(mode)), { description: "Execution mode: \"turns\" (default, structured resume) or \"interactive\" (persistent agent TUI in the owned pane)." })),
     name: Type.Optional(SAFE_NAME),
     parent: Type.Optional(Target),
     model: Type.Optional(Type.String({ minLength: 1, maxLength: 128, description: "Optional adapter-validated model selection." })),
     thinking: Type.Optional(Type.Union(THINKING_LEVELS.map((level) => Type.Literal(level)))),
   }), async execute(_id, p, signal, _update, ctx) {
-    const outcome = await generic.create({ agent: p.agent, cwd: p.cwd, name: p.name, parent: p.parent, model: p.model, thinking: p.thinking }, ctx.sessionManager.getSessionId(), signal);
+    const outcome = await generic.create({ agent: p.agent, cwd: p.cwd, mode: p.mode, name: p.name, parent: p.parent, model: p.model, thinking: p.thinking }, ctx.sessionManager.getSessionId(), signal);
     if (!outcome.ok) return subagentFailure("create subagent session", outcome);
     const { ok: _ok, ...value } = outcome;
     return result("create subagent session", value);

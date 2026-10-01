@@ -20,7 +20,7 @@ Input tools: `tmux_send_text` and `tmux_send_key` send literal text or one restr
 
 Guarded tools: `tmux_kill_session`, `tmux_kill_window`, and `tmux_kill_pane`.
 
-Pi subagent tools: the preferred, agent-neutral surface is `tmux_subagent_create` / `tmux_subagent_run` / `tmux_subagent_status` / `tmux_subagent_cancel` / `tmux_subagent_close`, which create and reuse a logical subagent session across turns. `tmux_subagent_start_pi` is the compatibility entrypoint for a one-shot **Pi** child job. Both create a durable record, own a dedicated detached tmux session, deliver the task without shell interpolation, and return immediately. The generic `tmux_*` tools remain available and unchanged for every other agent. See [Generic subagent session/turn tools](#generic-subagent-sessionturn-tools-preferred).
+Pi subagent tools: the preferred, agent-neutral surface is `tmux_subagent_create` / `tmux_subagent_run` / `tmux_subagent_status` / `tmux_subagent_cancel` / `tmux_subagent_close`, which create and reuse a logical subagent session across turns. `tmux_subagent_start_pi` is the compatibility entrypoint for a one-shot **Pi** child job. Both create a durable record, own a dedicated detached tmux session, deliver the task without shell interpolation, and return immediately. `tmux_subagent_create` also accepts `mode: "interactive"` to run a persistent Claude Code/OpenCode TUI in the owned pane instead of structured turns (see [Interactive TUI mode](#interactive-tui-mode-mode-interactive)). The generic `tmux_*` tools remain available and unchanged for every other agent. See [Generic subagent session/turn tools](#generic-subagent-sessionturn-tools-preferred).
 
 Use stable IDs from list/inspect results (`$N` session, `@N` window, `%N` pane) as targets. Exact human-readable selectors are accepted only when unambiguous. Mutations always resolve a target first and use its stable ID; there is no fallback to another target. Names are limited to 64 characters and cannot contain control characters. Working directories must already exist. Resize dimensions are 1–500 cells. Named keys are restricted to Enter, Escape, Tab, BTab, Space, Backspace, Delete, arrows, Home, End, PageUp, PageDown, and the documented `C-*` keys in the tool description.
 
@@ -120,7 +120,7 @@ executable, argv, or shell command: an agent is selected only by the bounded
 
 | Tool | Semantics |
 |---|---|
-| `tmux_subagent_create` | `{ agent, cwd, name?, parent?, model?, thinking? }` -> `{ sessionId, agent, status, tmuxSessionId, … }`. Creates a reusable session and its tmux boundary; starts **no** turn. |
+| `tmux_subagent_create` | `{ agent, cwd, mode?, name?, parent?, model?, thinking? }` -> `{ sessionId, agent, mode, status, tmuxSessionId, tmuxPaneId?, … }`. Default `mode: "turns"` creates a reusable session and its tmux boundary and starts **no** turn. `mode: "interactive"` instead launches the agent's own persistent TUI in the owned pane (see [Interactive TUI mode](#interactive-tui-mode-mode-interactive)). |
 | `tmux_subagent_run` | `{ sessionId, task, model?, thinking? }` -> `{ sessionId, turnId, status, tmuxSessionId, tmuxPaneId, turnIndex }`. Creates and launches one turn on the session; rejects a second concurrent turn. |
 | `tmux_subagent_status` | `{ sessionId, turnId? }` for a session/turn, or `{ jobId }` for the legacy Pi job API. Durable state only; reconciles a vanished/re-identified target to `lost` when tmux is reachable. |
 | `tmux_subagent_cancel` | `{ sessionId, turnId? }` cancels the active turn and leaves the session reusable; `{ jobId }` keeps the legacy Pi job behavior. |
@@ -305,6 +305,78 @@ tmux session
 - **Testing.** The default suite uses a fake `opencode` executable and requires no
   OpenCode account or provider credentials. A credentialed smoke test is
   intentionally not part of the default run.
+
+## Interactive TUI mode (`mode: "interactive"`)
+
+Issue #15 adds an optional interactive execution mode. **Structured turns remain
+the default orchestration protocol**; interactive mode is for a human who wants
+to watch, attach to, or drive the agent's own terminal UI. It is never a
+completion protocol.
+
+```ts
+tmux_subagent_create({ agent: "claude-code" | "opencode", cwd, mode: "interactive" })
+```
+
+- **Topology.** `turns` (the default) runs one structured turn at a time in the
+  owned tmux boundary. `interactive` launches the agent's real TUI in one owned
+  detached tmux pane:
+
+  ```text
+  tmux session ($N)
+    └─ pane (%N)   claude                              (Claude Code)
+                   opencode --standalone               (OpenCode)
+  ```
+
+  The pane starts inert (`exec sleep 3600`) and is only respawned into the TUI
+  after the session is durably bound and the tmux server identity is recorded, so
+  a handoff can never race an unbound record.
+- **OpenCode isolation.** Interactive OpenCode always runs `opencode
+  --standalone`, so the TUI uses a private server inside the owned process tree
+  instead of attaching to the user's shared background daemon. `--attach` is
+  never passed, and a managed TUI is never silently pointed at the shared
+  daemon.
+- **Liveness, not completion.** An interactive session is `starting ->
+  interactive -> stopped | lost`. There is no turn and no completion event:
+  liveness is the bound tmux session/pane process liveness. Pane text is never
+  parsed as a completion signal, and no `completed` turn is ever fabricated.
+  `tmux_subagent_status` reconciles a vanished pane (or a changed tmux server
+  identity) to `lost`.
+- **Metadata for handoff.** `tmux_subagent_create` returns `{ sessionId, agent,
+  mode, status, tmuxSessionId, tmuxPaneId, name, cwd }`. The caller switches an
+  attached client with `tmux_select_session`, inspects with
+  `tmux_inspect_pane`, captures with `tmux_capture_pane`, and sends input with
+  `tmux_send_text` / `tmux_send_key`. There are no agent-specific
+  send/capture tools; the existing generic tmux tools and their ownership /
+  confirmation / revalidation rules are reused unchanged.
+- **Human handoff flow.**
+
+  ```text
+  Pi creates an interactive subagent (mode: "interactive")
+          ↓
+  user switches/attaches a tmux client to $N (tmux_select_session; never auto-attach)
+          ↓
+  user interacts directly with Claude/OpenCode in pane %N
+          ↓
+  user returns to the parent Pi conversation
+          ↓
+  parent inspects (status/capture) and closes it (tmux_subagent_close)
+  ```
+
+  The extension never attaches a client or replaces the user's terminal on its
+  own.
+- **No turns.** `tmux_subagent_run` and `tmux_subagent_cancel` are refused on an
+  interactive session (`invalid_option`); `tmux_subagent_close` cancels nothing,
+  stops the session, and kills only the positively verified `$N` (recorded
+  identity still matching and the stable ID still live), otherwise fails closed.
+- **Security.** Interactive mode preserves every existing confirmation and
+  revalidation rule, adds no `--dangerously-skip-permissions`, `--auto`,
+  `--yolo`, or other approval/permission-disabling flag, and never mutates
+  project/user config. A captured pane remains an explicit snapshot that may
+  contain secrets. Only adapters that declare an interactive contract support
+  the mode: `claude-code` and `opencode`. `pi` and a deployer `RunnerSpecV1`
+  reject `mode: "interactive"` rather than guess a TUI contract.
+- **Testing.** The default suite uses fake `claude` / `opencode` executables and
+  an isolated private tmux server; no account or installed CLI is required.
 
 ## Pi child completion reporter
 
