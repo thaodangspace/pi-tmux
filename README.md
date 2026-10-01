@@ -142,10 +142,11 @@ executable, argv, or shell command: an agent is selected only by the bounded
 - **Status never scrapes panes.** `status` reads the durable session/turn
   registry and reconciles it against a live tmux view; a vanished target becomes
   `lost`, and pane output is never used to infer completion.
-- **Adapters, not argv.** The default registry contains a Pi adapter. Deployers
-  can enable `claude-code` / `opencode` by supplying a `RunnerSpecV1` map as JSON
-  in `PI_TMUX_AGENT_SPECS` (or the `agentSpecs` option). A malformed spec is
-  ignored rather than guessed, and the model never supplies a command.
+- **Adapters, not argv.** The default registry contains a Pi adapter and a
+  first-class Claude Code adapter (issue #13). Deployers can add or override an
+  `opencode` / `claude-code` runner by supplying a `RunnerSpecV1` map as JSON in
+  `PI_TMUX_AGENT_SPECS` (or the `agentSpecs` option). A malformed spec is ignored
+  rather than guessed, and the model never supplies a command.
 - **Compatibility.** `tmux_subagent_start_pi` and the `jobId` form of
   `status`/`cancel` continue to operate on `SubagentJobV1` records unchanged; a
   stored job ID is never silently reinterpreted as a logical session ID.
@@ -206,9 +207,51 @@ tmux server
   loop. It emits the same `pi-tmux:subagent-completed` event family (with
   distinct `agent`/`sessionId`/`turnId`), is owner-scoped, observes only while a
   turn is active or undelivered, and acknowledges delivery durably.
-- The concrete Claude Code / OpenCode flag sets are intentionally **not**
-  hard-coded anywhere: they are deployer-supplied `RunnerSpecV1` data, so a
-  runner never guesses a CLI that may not match the installed version.
+- The generic `RunnerAdapter` never guesses an agent CLI: a deployer supplies the
+  `RunnerSpecV1`. The dedicated `ClaudeCodeAdapter` (below) assembles a bounded,
+  version-stable Claude Code argv internally because Claude Code is first-class.
+
+## Claude Code adapter (`claude-code`)
+
+Issue #13 adds `agent: "claude-code"` as a first-class, resumable subagent. It
+still executes inside the pi-tmux-owned tmux boundary, but orchestration uses
+Claude's structured print mode rather than TUI scraping:
+
+```text
+tmux session
+  └─ generic runner (src/turn-runner.ts)
+       └─ claude -p --output-format json [--model <model>] [--resume <session_id>]
+```
+
+- `src/claude-adapter.ts` (`ClaudeCodeAdapter`) resolves the `claude` executable
+  **without a shell**, assembles the finite argv internally, and hands it to the
+  generic runner as a `RunnerSpecV1`. The model never supplies a command or argv.
+- **Resumable turns.** The first turn runs `claude -p --output-format json` and
+  the runner captures Claude's native `session_id` into the logical session's
+  `agentSessionId`. Later turns run `claude -p --output-format json --resume
+  <agentSessionId>`, resuming exactly that id — never `--continue`/"most recent
+  conversation". A continuation whose logical session has no recorded
+  `agentSessionId` (for example after a failed first turn) is **rejected**, so
+  orchestration can never silently attach to an unrelated conversation.
+- **Structured completion only.** Success requires the runner's exit code, the
+  parsed JSON `is_error` flag, and parseable output; a JSON-reported error, a
+  non-zero exit, malformed/truncated output, or a cancelled/lost turn is recorded
+  as `failed`. Pane text is never inspected.
+- **Bounded model option.** `model` is validated against `[A-Za-z0-9._@:/-]+` and
+  passed as `--model <value>`. A `thinking` option is rejected rather than
+  silently ignored. No `--dangerously-skip-permissions` (or any other
+  permission-disabling flag) is ever added, and no project/user config is mutated
+  to launch a turn.
+- **Auth / billing safety.** Claude Code uses a logged-in subscription unless an
+  inherited `ANTHROPIC_API_KEY` is present, which switches it to API billing.
+  Preflight checks **presence only** and surfaces bounded, non-secret metadata on
+  `tmux_subagent_create` / `tmux_subagent_run` results:
+  `claudeAuthRisk: "api-key-present" | "none-detected"`, `claudeBilling:
+  "api" | "subscription-or-unauthenticated"`, and a `claudeAuthNote`. pi-tmux
+  never sets, deletes, replaces, logs, or persists the key or its value.
+- **Testing.** The default suite uses a fake `claude` executable and requires no
+  Claude account. A credentialed smoke test is intentionally not part of the
+  default run.
 
 ## Pi child completion reporter
 

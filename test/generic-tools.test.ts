@@ -101,7 +101,7 @@ function fakeAdapter(agent: "claude-code" | "opencode"): AgentAdapter {
     provenanceTool: `tmux_subagent_start_${agent}`,
     placeholderCommand: "exec sleep 3600",
     validateOptions: (input) => (input.model === "bad model" ? "model invalid" : undefined),
-    async preflight() { return { ok: true, env: { FAKE_BIN: `/fake/${agent}` } }; },
+    async preflight() { return { ok: true, env: { FAKE_BIN: `/fake/${agent}` }, metadata: { fakeAuthRisk: "none-detected" } }; },
     async prepareTurn(input) {
       return {
         command: 'exec "$FAKE_BIN" -p -- "$FAKE_TASK"',
@@ -164,12 +164,14 @@ test("a fake Claude Code adapter runs the full reusable lifecycle through the to
     const createdBody = h.body(created);
     assert.equal(createdBody.status, "idle");
     assert.equal(createdBody.agent, "claude-code");
+    assert.deepEqual(createdBody.metadata, { fakeAuthRisk: "none-detected" }, "preflight metadata is surfaced on create");
     const sessionId = createdBody.sessionId as string;
 
     const running = await h.call("tmux_subagent_run", { sessionId, task: "do the work" });
     assert.equal(running.isError, undefined, running.content[0].text);
     const runBody = h.body(running);
     assert.equal(runBody.sessionId, sessionId);
+    assert.deepEqual(runBody.metadata, { fakeAuthRisk: "none-detected" }, "preflight metadata is surfaced on run");
     const turnId = runBody.turnId as string;
     assert.ok(turnId);
 

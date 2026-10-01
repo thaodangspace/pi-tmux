@@ -180,9 +180,14 @@ export interface SubagentStartSuccess {
   owner: string;
   turnIndex: number;
   serverIdentity?: string;
+  /** Bounded, non-secret launch metadata from the adapter preflight (for example auth/billing risk). */
+  metadata?: Readonly<Record<string, string>>;
 }
 
 export type SubagentStartResult = SubagentStartSuccess | SubagentFailure;
+
+/** Adapter preflight values threaded through a launch: constant pane env plus non-secret metadata. */
+type AgentPreflightEnv = { env: Record<string, string>; metadata?: Readonly<Record<string, string>> };
 
 export type SubagentStatusResult =
   | { ok: true; run: SubagentRunRecord; targetLive?: boolean; reconciled: boolean; tmuxUnavailable?: boolean }
@@ -202,6 +207,8 @@ export interface SubagentCreateSuccess {
   cwd: string;
   owner: string;
   serverIdentity?: string;
+  /** Bounded, non-secret launch metadata from the adapter preflight (for example auth/billing risk). */
+  metadata?: Readonly<Record<string, string>>;
 }
 
 export type SubagentCreateResult = SubagentCreateSuccess | SubagentFailure;
@@ -346,7 +353,7 @@ export class SubagentController {
     }
 
     const name = sessionName(input.name, sessionId, this.adapter.sessionNamePrefix ?? `${this.adapter.agent}-subagent`);
-    return this.launchSessionTurn(run, session.tmuxSessionId, session.serverIdentity, input, owner, cwd, ancestors, preflight.env, name, signal);
+    return this.launchSessionTurn(run, session.tmuxSessionId, session.serverIdentity, input, owner, cwd, ancestors, preflight, name, session.agentSessionId, signal);
   }
 
   /**
@@ -441,6 +448,7 @@ export class SubagentController {
       cwd,
       owner,
       serverIdentity,
+      ...(preflight.metadata ? { metadata: preflight.metadata } : {}),
     };
   }
 
@@ -805,7 +813,7 @@ export class SubagentController {
       return { ok: false, code: codeOf(error), error: message, runId: run.runId, status: "failed", cleanedUp };
     }
 
-    return this.launchBound(run, sessionId, paneId, input, owner, cwd, ancestors, preflight.env, name, serverIdentity, signal);
+    return this.launchBound(run, sessionId, paneId, input, owner, cwd, ancestors, preflight, name, undefined, serverIdentity, signal);
   }
 
   private async startSession(input: SubagentTurnOptions, owner: string, cwd: string, ancestors: string[], signal?: AbortSignal): Promise<SubagentStartResult> {
@@ -865,7 +873,7 @@ export class SubagentController {
       return { ok: false, code: codeOf(error), error: message, sessionId: session.sessionId, cleanedUp };
     }
 
-    return this.launchSessionTurn(run, tmuxSessionId, serverIdentity, input, owner, cwd, ancestors, preflight.env, name, signal);
+    return this.launchSessionTurn(run, tmuxSessionId, serverIdentity, input, owner, cwd, ancestors, preflight, name, session.agentSessionId, signal);
   }
 
   /** Provisions a brand-new window/pane for an already-created turn and launches it. */
@@ -877,8 +885,9 @@ export class SubagentController {
     owner: string,
     cwd: string,
     ancestors: string[],
-    preflightEnv: Record<string, string>,
+    preflight: AgentPreflightEnv,
     name: string,
+    agentSessionId: string | undefined,
     signal?: AbortSignal,
   ): Promise<SubagentStartResult> {
     let paneId: string;
@@ -900,7 +909,7 @@ export class SubagentController {
       return { ok: false, code: codeOf(error), error: message, runId: run.runId, status: "failed", cleanedUp };
     }
 
-    return this.launchBound(run, tmuxSessionId, paneId, input, owner, cwd, ancestors, preflightEnv, name, serverIdentity, signal);
+    return this.launchBound(run, tmuxSessionId, paneId, input, owner, cwd, ancestors, preflight, name, agentSessionId, serverIdentity, signal);
   }
 
   /** Shared launch + bounded startup probe once a run is durably bound and `starting`. */
@@ -912,8 +921,9 @@ export class SubagentController {
     owner: string,
     cwd: string,
     ancestors: string[],
-    preflightEnv: Record<string, string>,
+    preflight: AgentPreflightEnv,
     name: string,
+    agentSessionId: string | undefined,
     serverIdentity: string | undefined,
     signal?: AbortSignal,
   ): Promise<SubagentStartResult> {
@@ -928,14 +938,15 @@ export class SubagentController {
         sessionId: run.sessionId,
         ledgerKind: this.ledger.kind,
         turnIndex: run.turnIndex ?? 1,
+        ...(agentSessionId !== undefined ? { agentSessionId } : {}),
         ancestors,
-        preflight: preflightEnv,
+        preflight: preflight.env,
         env: this.env,
         signal,
       };
       const spec = await this.adapter.prepareTurn(input, context);
       command = spec.command;
-      env = { ...preflightEnv, ...spec.env };
+      env = { ...preflight.env, ...spec.env };
     } catch (error) {
       const cleanedUp = await this.cleanupSession(tmuxSessionId, signal);
       const message = `Could not prepare the child launch: ${errorMessage(error)}`;
@@ -974,6 +985,7 @@ export class SubagentController {
             owner,
             turnIndex: run.turnIndex ?? 1,
             serverIdentity,
+            ...(preflight.metadata ? { metadata: preflight.metadata } : {}),
           };
         }
         return {
@@ -1003,6 +1015,7 @@ export class SubagentController {
       owner,
       turnIndex: run.turnIndex ?? 1,
       serverIdentity,
+      ...(preflight.metadata ? { metadata: preflight.metadata } : {}),
     };
   }
 
