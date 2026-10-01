@@ -63,4 +63,4 @@ The pre-existing 58 tests still pass unchanged (backward-compatible generic tool
 
 ## PR
 
-Opened against `main` from `issue-3-pi-subagent`, referencing #3 without a closing keyword. Not merged; issue #3 left open for review.
+URL: https://github.com/thaodangspace/pi-tmux/pull/7 (base `main`, head `issue-3-pi-subagent`). References #3 without a closing keyword. Not merged; issue #3 left open for review.
